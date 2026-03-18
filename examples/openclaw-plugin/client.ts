@@ -100,6 +100,19 @@ export class OpenVikingClient {
       if (this.agentId) {
         headers.set("X-OpenViking-Agent", this.agentId);
       }
+      // Inject tenant identity for ROOT API key requests.
+      // Skip for system/health endpoints to avoid infinite recursion
+      // (getRuntimeIdentity calls /api/v1/system/status via request()).
+      const skipTenant = path.startsWith("/api/v1/system/") || path.startsWith("/health");
+      if (!skipTenant) {
+        const identity = await this.getRuntimeIdentity();
+        if (!headers.has("X-OpenViking-Account")) {
+          headers.set("X-OpenViking-Account", identity.userId);
+        }
+        if (!headers.has("X-OpenViking-User")) {
+          headers.set("X-OpenViking-User", identity.userId);
+        }
+      }
       if (init.body && !headers.has("Content-Type")) {
         headers.set("Content-Type", "application/json");
       }
