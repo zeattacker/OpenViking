@@ -2,7 +2,7 @@ metadata:
   id: "compression.dedup_decision"
   name: "Memory Deduplication Decision"
   description: "Decide candidate action (skip/create/none) and per-memory actions (merge/delete)"
-  version: "3.3.1"
+  version: "3.4.0"
   language: "en"
   category: "compression"
 
@@ -55,6 +55,12 @@ template: |
   - merge:
     Existing memory and candidate are about the same subject and should be unified.
     Use for refinement, correction, partial conflict, or complementary details.
+  - evolve:
+    Existing memory and candidate are about the same subject. Candidate provides
+    new supporting evidence, confirmation, or additional context that reinforces
+    the existing memory without contradicting it. Unlike merge (which rewrites
+    content), evolve preserves existing content and appends new evidence.
+    Use when: candidate reinforces or supplements, does not contradict.
   - delete:
     Existing memory must be removed only if candidate fully invalidates the entire
     existing memory (not just one sub-part).
@@ -69,9 +75,10 @@ template: |
 
   Decision guidance:
   - Prefer skip when candidate is redundant.
-  - Prefer none+merge for same-subject updates and partial contradictions.
+  - Prefer none+evolve when candidate confirms or supplements existing memory.
+  - Prefer none+merge when candidate updates or partially conflicts with existing.
   - Prefer create for clearly new independent memory.
-  - If uncertain, choose non-destructive behavior (skip or merge), not delete.
+  - If uncertain, choose non-destructive behavior (skip or evolve), not delete.
 
   Practical checklist before emitting each list item:
   1) Is existing memory about the same topic/facet as candidate?
@@ -94,7 +101,7 @@ template: |
     "list": [
       {
         "uri": "<existing memory uri>",
-        "decide": "merge|delete",
+        "decide": "merge|delete|evolve",
         "reason": "short reason (for delete, explain full invalidation)"
       }
     ]

@@ -1,0 +1,56 @@
+metadata:
+  id: "compression.memory_evolution"
+  name: "Memory Evolution"
+  description: "Enrich an existing memory with new supporting evidence"
+  version: "1.0.0"
+  language: "en"
+  category: "compression"
+
+variables:
+  - name: "existing_abstract"
+    type: "string"
+    description: "Abstract of the existing memory"
+    required: true
+  - name: "existing_content"
+    type: "string"
+    description: "Full content of the existing memory"
+    required: true
+  - name: "new_abstract"
+    type: "string"
+    description: "Abstract of the new evidence"
+    required: true
+  - name: "new_content"
+    type: "string"
+    description: "Content of the new evidence"
+    required: true
+  - name: "category"
+    type: "string"
+    description: "Memory category"
+    required: true
+  - name: "output_language"
+    type: "string"
+    description: "Language for output"
+    required: false
+
+template: |
+  An existing memory is being reinforced with new evidence.
+
+  Existing memory:
+  - Abstract: {{ existing_abstract }}
+  - Content: {{ existing_content }}
+
+  New evidence:
+  - Abstract: {{ new_abstract }}
+  - Content: {{ new_content }}
+
+  Rules:
+  - Preserve ALL original content. Do not remove or rewrite existing information.
+  - Append new evidence as additional context, examples, or confirmation.
+  - If new evidence contradicts existing, note both perspectives.
+  - Update the abstract to reflect the enriched scope.
+  {% if output_language %}Output in {{ output_language }}.{% endif %}
+
+  Return JSON: {"abstract": "...", "overview": "...", "content": "..."}
+
+llm_config:
+  temperature: 0.0

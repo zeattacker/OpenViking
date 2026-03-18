@@ -45,8 +45,9 @@ export const localClientPendingPromises = new Map<string, PendingClientEntry>();
 const MEMORY_URI_PATTERNS = [
   /^viking:\/\/user\/(?:[^/]+\/)?memories(?:\/|$)/,
   /^viking:\/\/agent\/(?:[^/]+\/)?memories(?:\/|$)/,
+  /^viking:\/\/user\/(?:[^/]+\/)?episodes(?:\/|$)/,
 ];
-const USER_STRUCTURE_DIRS = new Set(["memories"]);
+const USER_STRUCTURE_DIRS = new Set(["memories", "episodes"]);
 const AGENT_STRUCTURE_DIRS = new Set(["memories", "skills", "instructions", "workspaces"]);
 
 function md5Short(input: string): string {
@@ -289,5 +290,22 @@ export class OpenVikingClient {
     await this.request(`/api/v1/fs?uri=${encodeURIComponent(uri)}&recursive=false`, {
       method: "DELETE",
     });
+  }
+
+  async trackRecall(uris: string[]): Promise<void> {
+    if (uris.length === 0) return;
+    await this.request<{ updated: number }>("/api/v1/search/track-recall", {
+      method: "POST",
+      body: JSON.stringify({ uris }),
+    });
+  }
+
+  async readProfile(): Promise<string> {
+    try {
+      const profileUri = await this.normalizeTargetUri("viking://user/memories/profile.md");
+      return await this.read(profileUri);
+    } catch {
+      return "";
+    }
   }
 }

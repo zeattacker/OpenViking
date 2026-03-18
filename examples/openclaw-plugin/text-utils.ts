@@ -1,17 +1,25 @@
 import type { CaptureMode } from "./client.js";
 
+export type TurnMessage = {
+  role: "user" | "assistant";
+  content: string;
+  toolCalls?: Array<{ name: string; input: string; result?: string }>;
+};
+
 export const MEMORY_TRIGGERS = [
   /remember|preference|prefer|important|decision|decided|always|never/i,
+  /ingat|preferensi|suka|senang|kagum|benci|takut|penting|keputusan|selalu|tidak pernah|prioritas|kebiasaan|hobi|ahli|favorit|tidak suka/i,
   /记住|偏好|喜欢|喜爱|崇拜|讨厌|害怕|重要|决定|总是|永远|优先|习惯|爱好|擅长|最爱|不喜欢/i,
   /[\w.-]+@[\w.-]+\.\w+/,
   /\+\d{10,}/,
-  /(?:我|my)\s*(?:是|叫|名字|name|住在|live|来自|from|生日|birthday|电话|phone|邮箱|email)/i,
-  /(?:我|i)\s*(?:喜欢|崇拜|讨厌|害怕|擅长|不会|爱|恨|想要|需要|希望|觉得|认为|相信)/i,
+  /(?:saya|我|my)\s*(?:adalah|nama|是|叫|名字|name|tinggal|住在|live|dari|来自|from|ulang tahun|生日|birthday|telepon|电话|phone|email|邮箱)/i,
+  /(?:saya|我|i)\s*(?:suka|kagum|benci|takut|ahli|tidak bisa|cinta|ingin|butuh|harap|pikir|percaya|喜欢|崇拜|讨厌|害怕|擅长|不会|爱|恨|想要|需要|希望|觉得|认为|相信)/i,
   /(?:favorite|favourite|love|hate|enjoy|dislike|admire|idol|fan of)/i,
 ];
 
 const CJK_CHAR_REGEX = /[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uac00-\ud7af]/;
 const RELEVANT_MEMORIES_BLOCK_RE = /<relevant-memories>[\s\S]*?<\/relevant-memories>/gi;
+const AUTO_RECALL_BLOCK_RE = /\[Auto-invoked: memory_recall\([^\)]*\)\][\s\S]*?(?=\n\[(?:user|assistant)\]:|$)/gi;
 const CONVERSATION_METADATA_BLOCK_RE =
   /(?:^|\n)\s*(?:Conversation info|Conversation metadata|会话信息|对话信息)\s*(?:\([^)]+\))?\s*:\s*```[\s\S]*?```/gi;
 /** Strips "Sender (untrusted metadata): ```json ... ```" so capture sends clean text to OpenViking extract. */
@@ -23,9 +31,9 @@ const LEADING_TIMESTAMP_PREFIX_RE = /^\s*\[[^\]\n]{1,120}\]\s*/;
 const COMMAND_TEXT_RE = /^\/[a-z0-9_-]{1,64}\b/i;
 const NON_CONTENT_TEXT_RE = /^[\p{P}\p{S}\s]+$/u;
 const SUBAGENT_CONTEXT_RE = /^\s*\[Subagent Context\]/i;
-const MEMORY_INTENT_RE = /记住|记下|remember|save|store|偏好|preference|规则|rule|事实|fact/i;
+const MEMORY_INTENT_RE = /ingat|catat|记住|记下|remember|save|store|preferensi|偏好|preference|aturan|规则|rule|fakta|事实|fact/i;
 const QUESTION_CUE_RE =
-  /[?？]|\b(?:what|when|where|who|why|how|which|can|could|would|did|does|is|are)\b|^(?:请问|能否|可否|怎么|如何|什么时候|谁|什么|哪|是否)/i;
+  /[?？]|\b(?:what|when|where|who|why|how|which|can|could|would|did|does|is|are)\b|^(?:apakah|bisakah|bolehkah|bagaimana|kapan|siapa|apa|mana|dimana|请问|能否|可否|怎么|如何|什么时候|谁|什么|哪|是否)/i;
 const SPEAKER_TAG_RE = /(?:^|\s)([A-Za-z\u4e00-\u9fa5][A-Za-z0-9_\u4e00-\u9fa5-]{1,30}):\s/g;
 
 export const CAPTURE_LIMIT = 3;
@@ -49,6 +57,7 @@ function looksLikeMetadataJsonBlock(content: string): boolean {
 export function sanitizeUserTextForCapture(text: string): string {
   return text
     .replace(RELEVANT_MEMORIES_BLOCK_RE, " ")
+    .replace(AUTO_RECALL_BLOCK_RE, " ")
     .replace(CONVERSATION_METADATA_BLOCK_RE, " ")
     .replace(SENDER_METADATA_BLOCK_RE, " ")
     .replace(FENCED_JSON_BLOCK_RE, (full, inner) =>
@@ -360,4 +369,112 @@ export function extractLatestUserText(messages: unknown[] | undefined): string {
     }
   }
   return "";
+}
+
+export function extractLastAssistantText(messages: unknown[]): string {
+  if (!messages || messages.length === 0) return "";
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i] as Record<string, unknown>;
+    if (!msg || typeof msg !== "object") continue;
+    if (msg.role !== "assistant") continue;
+    const content = msg.content;
+    if (typeof content === "string" && content.trim()) return content.trim();
+    if (Array.isArray(content)) {
+      const parts: string[] = [];
+      for (const block of content) {
+        const b = block as Record<string, unknown>;
+        if (b?.type === "text" && typeof b.text === "string") parts.push((b.text as string).trim());
+      }
+      if (parts.length > 0) return parts.join("\n");
+    }
+  }
+  return "";
+}
+
+/**
+ * Extract structured multi-turn messages from startIndex, preserving role separation
+ * and tool call context for proper OpenViking session ingestion.
+ */
+export function extractNewTurnMessages(
+  messages: unknown[],
+  startIndex: number,
+): { turns: TurnMessage[]; newCount: number } {
+  const turns: TurnMessage[] = [];
+  let count = 0;
+
+  for (let i = startIndex; i < messages.length; i++) {
+    const msg = messages[i] as Record<string, unknown>;
+    if (!msg || typeof msg !== "object") continue;
+
+    const role = msg.role as string;
+
+    if (role === "user") {
+      count++;
+      const text = extractTextContent(msg.content);
+      const sanitized = sanitizeUserTextForCapture(text);
+      if (sanitized) {
+        turns.push({ role: "user", content: sanitized });
+      }
+    } else if (role === "assistant") {
+      count++;
+      const text = extractTextContent(msg.content);
+      const toolCalls = extractToolCalls(msg.content);
+      if (text.trim() || toolCalls.length > 0) {
+        turns.push({
+          role: "assistant",
+          content: text.trim(),
+          ...(toolCalls.length > 0 ? { toolCalls } : {}),
+        });
+      }
+    } else if (role === "tool" || role === "toolResult" || role === "tool_result") {
+      // Attach result to the last assistant's matching tool call
+      const toolName = (msg.name ?? msg.tool_name ?? "") as string;
+      const resultText = extractTextContent(msg.content);
+      if (turns.length > 0) {
+        const lastTurn = turns[turns.length - 1]!;
+        if (lastTurn.role === "assistant" && lastTurn.toolCalls?.length) {
+          const match = lastTurn.toolCalls.find(
+            (tc) => tc.name === toolName && !tc.result,
+          );
+          if (match) {
+            match.result = resultText.slice(0, 1000);
+          }
+        }
+      }
+    }
+  }
+
+  return { turns, newCount: count };
+}
+
+function extractTextContent(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const parts: string[] = [];
+  for (const block of content) {
+    const b = block as Record<string, unknown>;
+    if (b?.type === "text" && typeof b.text === "string") {
+      parts.push(b.text);
+    }
+  }
+  return parts.join("\n");
+}
+
+function extractToolCalls(content: unknown): Array<{ name: string; input: string; result?: string }> {
+  if (!Array.isArray(content)) return [];
+  const calls: Array<{ name: string; input: string; result?: string }> = [];
+  for (const block of content) {
+    const b = block as Record<string, unknown>;
+    if (b?.type === "tool_use" || b?.type === "toolCall") {
+      const name = (b.name ?? b.tool_name ?? "unknown") as string;
+      let input = "";
+      if (typeof b.input === "string") {
+        input = b.input;
+      } else if (b.input && typeof b.input === "object") {
+        try { input = JSON.stringify(b.input); } catch { input = "[object]"; }
+      }
+      calls.push({ name, input });
+    }
+  }
+  return calls;
 }

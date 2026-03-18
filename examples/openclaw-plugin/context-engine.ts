@@ -1,8 +1,14 @@
 import type { OpenVikingClient } from "./client.js";
 import type { MemoryOpenVikingConfig } from "./config.js";
+import type { AlignmentResult } from "./alignment.js";
+import { alignmentCheck, assembleProfile } from "./alignment.js";
+import { DriftDetector } from "./drift.js";
+import { DEFAULT_MEMORY_OPENVIKING_DATA_DIR } from "./config.js";
 import {
   getCaptureDecision,
   extractNewTurnTexts,
+  extractNewTurnMessages,
+  extractLastAssistantText,
 } from "./text-utils.js";
 import {
   trimForLog,
@@ -134,6 +140,7 @@ export function createMemoryOpenVikingContextEngine(params: {
   logger: Logger;
   getClient: () => Promise<OpenVikingClient>;
   resolveAgentId: (sessionId: string) => string;
+  pendingAlignmentFlags?: Map<string, AlignmentResult>;
 }): ContextEngine {
   const {
     id,
@@ -155,6 +162,16 @@ export function createMemoryOpenVikingContextEngine(params: {
     }
     return client;
   };
+
+  const driftDetector = cfg.alignment?.enabled
+    ? new DriftDetector({
+        windowSize: cfg.alignment.driftWindowSize,
+        alertThreshold: cfg.alignment.driftAlertThreshold,
+        consecutiveFlagLimit: cfg.alignment.driftConsecutiveFlagLimit,
+        dataDir: DEFAULT_MEMORY_OPENVIKING_DATA_DIR,
+        logger,
+      })
+    : null;
 
   return {
     info: {
@@ -221,10 +238,30 @@ export function createMemoryOpenVikingContextEngine(params: {
           return;
         }
 
+        // Use structured turn messages for richer session ingestion (includes tool calls)
+        const { turns } = extractNewTurnMessages(messages, start);
+
         const client = await getClient();
         const sessionId = await client.createSession();
         try {
-          await client.addSessionMessage(sessionId, "user", decision.normalizedText);
+          // Ingest structured turns: each role's content goes as a separate session message
+          if (turns.length > 0) {
+            for (const turn of turns) {
+              let content = turn.content;
+              if (turn.toolCalls?.length) {
+                const toolSummary = turn.toolCalls
+                  .map((tc) => `[Tool: ${tc.name}]${tc.result ? ` → ${tc.result.slice(0, 200)}` : ""}`)
+                  .join("\n");
+                content = content ? `${content}\n${toolSummary}` : toolSummary;
+              }
+              if (content.trim()) {
+                await client.addSessionMessage(sessionId, turn.role, content.trim());
+              }
+            }
+          } else {
+            // Fallback to flat text if structured extraction yielded nothing
+            await client.addSessionMessage(sessionId, "user", decision.normalizedText);
+          }
           await client.getSession(sessionId).catch(() => ({}));
           const extracted = await client.extractSessionMemories(sessionId);
 
@@ -251,6 +288,56 @@ export function createMemoryOpenVikingContextEngine(params: {
         }
       } catch (err) {
         warnOrInfo(logger, `openviking: auto-capture failed: ${String(err)}`);
+      }
+
+      // P2: Alignment evaluation (post-delivery)
+      if (cfg.alignment?.enabled && driftDetector) {
+        try {
+          const assistantText = extractLastAssistantText(afterTurnParams.messages ?? []);
+          if (assistantText && assistantText.length > 20) {
+            const client = await getClient();
+            let instructionsText = "";
+            try {
+              instructionsText = await client.read("viking://agent/instructions/");
+            } catch {
+              // No instructions — only default constraints active
+            }
+
+            const profile = assembleProfile(instructionsText);
+            const result = alignmentCheck(assistantText, profile);
+
+            const alert = driftDetector.record(result);
+            const driftState = driftDetector.getState();
+
+            // Always log in observe_only for visibility
+            const responsePreview = assistantText.length > 80
+              ? `${assistantText.slice(0, 80)}...`
+              : assistantText;
+            logger.info(
+              `openviking: alignment verdict=${result.verdict} score=${result.score.toFixed(2)} ` +
+              `constraints=${profile.constraints.length} mode=${cfg.alignment.mode} ` +
+              `drift=[evaluated=${driftState.totalEvaluated},flagged=${driftState.totalFlagged},consecutive=${driftState.consecutiveFlags}] ` +
+              `response="${responsePreview}"`,
+            );
+
+            if (result.verdict !== "pass") {
+              logger.info(
+                `openviking: alignment issues: ${result.issues.map((i) => `[L${i.layer}:${i.type}] ${i.description}${i.matchedText ? ` (matched: ${i.matchedText})` : ""}`).join("; ")}`,
+              );
+              if (params.pendingAlignmentFlags) {
+                params.pendingAlignmentFlags.set(afterTurnParams.sessionId, result);
+              }
+            }
+            if (alert) {
+              warnOrInfo(
+                logger,
+                `openviking: DRIFT ALERT — mean=${alert.mean.toFixed(2)}, consecutiveFlags=${alert.consecutiveFlags}, totalEvaluated=${alert.totalEvaluated}`,
+              );
+            }
+          }
+        } catch (err) {
+          warnOrInfo(logger, `openviking: alignment check failed: ${String(err)}`);
+        }
       }
     },
 

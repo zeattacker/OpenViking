@@ -42,6 +42,23 @@ class SearchRequest(BaseModel):
     telemetry: TelemetryRequest = False
 
 
+class TrackRecallRequest(BaseModel):
+    """Request model for recall tracking."""
+
+    uris: list[str]
+
+
+@router.post("/track-recall")
+async def track_recall(
+    request: TrackRecallRequest,
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Increment active_count for recalled memory URIs."""
+    service = get_service()
+    updated = await service.vikingdb_manager.increment_active_count(_ctx, request.uris)
+    return Response(status="ok", result={"updated": updated})
+
+
 class GrepRequest(BaseModel):
     """Request model for grep."""
 

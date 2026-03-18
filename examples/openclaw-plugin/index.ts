@@ -6,6 +6,7 @@ import { memoryOpenVikingConfigSchema } from "./config.js";
 
 import { OpenVikingClient, localClientCache, isMemoryUri } from "./client.js";
 import type { FindResultItem } from "./client.js";
+import type { AlignmentResult } from "./alignment.js";
 import {
   isTranscriptLikeIngest,
   extractLatestUserText,
@@ -198,6 +199,12 @@ const contextEnginePlugin = {
               details: { count: 0, total: result.total ?? 0, scoreThreshold },
             };
           }
+          // Track recalled URIs for decay scoring (fire-and-forget)
+          const recalledUris = memories.map((m: FindResultItem) => m.uri);
+          (await getClient()).trackRecall(recalledUris).catch((err) => {
+            api.logger.warn(`openviking: recall tracking failed: ${String(err)}`);
+          });
+
           return {
             content: [
               {
@@ -216,6 +223,102 @@ const contextEnginePlugin = {
         },
       },
       { name: "memory_recall" },
+    );
+
+    api.registerTool(
+      {
+        name: "memory_recall_episodes",
+        label: "Episode Recall (OpenViking)",
+        description:
+          "Search past conversation episode summaries from OpenViking. Use when you need to recall what was discussed in previous conversations.",
+        parameters: Type.Object({
+          query: Type.String({ description: "Search query for episode content" }),
+          limit: Type.Optional(
+            Type.Number({ description: "Max results (default: 5)" }),
+          ),
+          after_date: Type.Optional(
+            Type.String({ description: "Only return episodes after this date (YYYY-MM-DD)" }),
+          ),
+          before_date: Type.Optional(
+            Type.String({ description: "Only return episodes before this date (YYYY-MM-DD)" }),
+          ),
+        }),
+        async execute(_toolCallId: string, params: Record<string, unknown>) {
+          const { query } = params as { query: string };
+          const limit =
+            typeof (params as { limit?: number }).limit === "number"
+              ? Math.max(1, Math.floor((params as { limit: number }).limit))
+              : 5;
+          const afterDate = (params as { after_date?: string }).after_date;
+          const beforeDate = (params as { before_date?: string }).before_date;
+
+          const client = await getClient();
+          const requestLimit = Math.max(limit * 4, 20);
+          const result = await client.find(query, {
+            targetUri: "viking://user/episodes",
+            limit: requestLimit,
+            scoreThreshold: 0,
+          });
+
+          let episodes = result.memories ?? [];
+
+          // Date filtering: parse timestamp from URI filename (ep_{sid}_{YYYYMMDDTHHmmSS}.md)
+          if (afterDate || beforeDate) {
+            const parseEpisodeDate = (uri: string): Date | null => {
+              const match = uri.match(/ep_[^_]+_(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})\.md/);
+              if (!match) return null;
+              return new Date(`${match[1]}-${match[2]}-${match[3]}T${match[4]}:${match[5]}:${match[6]}Z`);
+            };
+
+            episodes = episodes.filter((ep) => {
+              const epDate = parseEpisodeDate(ep.uri);
+              if (!epDate) return true; // keep episodes with unparseable dates
+              if (afterDate && epDate < new Date(afterDate + "T00:00:00Z")) return false;
+              if (beforeDate && epDate > new Date(beforeDate + "T23:59:59Z")) return false;
+              return true;
+            });
+          }
+
+          // Limit results
+          episodes = episodes.slice(0, limit);
+
+          if (episodes.length === 0) {
+            return {
+              content: [{ type: "text", text: "No relevant episode summaries found." }],
+              details: { count: 0 },
+            };
+          }
+
+          // Read full episode content for each result
+          const episodeLines = await Promise.all(
+            episodes.map(async (ep) => {
+              try {
+                const content = await client.read(ep.uri);
+                if (content && typeof content === "string" && content.trim()) {
+                  return `---\n**URI:** ${ep.uri}\n${content.trim()}`;
+                }
+              } catch {
+                // fallback to abstract
+              }
+              return `---\n**URI:** ${ep.uri}\n${ep.abstract ?? "No summary available"}`;
+            }),
+          );
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: `Found ${episodes.length} episode(s):\n\n${episodeLines.join("\n\n")}`,
+              },
+            ],
+            details: {
+              count: episodes.length,
+              episodes: episodes.map((ep) => ({ uri: ep.uri, abstract: ep.abstract, score: ep.score })),
+            },
+          };
+        },
+      },
+      { name: "memory_recall_episodes" },
     );
 
     api.registerTool(
@@ -384,6 +487,7 @@ const contextEnginePlugin = {
       },
       { name: "memory_forget" },
     );
+    const pendingAlignmentFlags = new Map<string, AlignmentResult>();
     const sessionAgentIds = new Map<string, string>();
     const rememberSessionAgentId = (ctx: {
       agentId?: string;
@@ -430,6 +534,43 @@ const contextEnginePlugin = {
 
       const prependContextParts: string[] = [];
 
+      // P2: Alignment correction injection
+      if (cfg.alignment?.enabled) {
+        const pendingFlag = pendingAlignmentFlags.get(hookSessionId);
+        if (pendingFlag && cfg.alignment.mode === "full_enforce") {
+          prependContextParts.push(
+            "<alignment-correction>\n" +
+            `Your previous response was flagged: ${pendingFlag.issues.map((i) => i.description).join(", ")}\n` +
+            "Please ensure your next response addresses these concerns.\n" +
+            "</alignment-correction>",
+          );
+          pendingAlignmentFlags.delete(hookSessionId);
+        } else if (pendingFlag) {
+          pendingAlignmentFlags.delete(hookSessionId);
+        }
+        // Expire stale flags (TTL: 30 min)
+        const now = Date.now();
+        for (const [sid, flag] of pendingAlignmentFlags) {
+          if (now - flag.timestamp > 30 * 60 * 1000) {
+            pendingAlignmentFlags.delete(sid);
+          }
+        }
+      }
+
+      if (cfg.profileInjection) {
+        try {
+          const profile = await client.readProfile();
+          if (profile && profile.trim()) {
+            prependContextParts.push(
+              "<user-profile>\n" + profile.trim() + "\n</user-profile>",
+            );
+            api.logger.info("openviking: injected user profile into context");
+          }
+        } catch (err) {
+          api.logger.warn(`openviking: profile injection failed: ${String(err)}`);
+        }
+      }
+
       if (cfg.autoRecall && queryText.length >= 5) {
         const precheck = await quickRecallPrecheck(cfg.mode, cfg.baseUrl, cfg.port, localProcess);
         if (!precheck.ok) {
@@ -473,6 +614,12 @@ const contextEnginePlugin = {
             const memories = pickMemoriesForInjection(processed, cfg.recallLimit, queryText);
 
             if (memories.length > 0) {
+              // Track auto-recalled URIs (fire-and-forget)
+              const autoRecalledUris = memories.map((m: FindResultItem) => m.uri);
+              client.trackRecall(autoRecalledUris).catch((err) => {
+                api.logger.warn(`openviking: auto-recall tracking failed: ${String(err)}`);
+              });
+
               const memoryLines = await Promise.all(
                 memories.map(async (item: FindResultItem) => {
                   if (item.level === 2) {
@@ -493,11 +640,18 @@ const contextEnginePlugin = {
               api.logger.info(
                 `openviking: inject-detail ${toJsonLog({ count: memories.length, memories: summarizeInjectionMemories(memories) })}`,
               );
-              prependContextParts.push(
-                "<relevant-memories>\nThe following OpenViking memories may be relevant:\n" +
-                  `${memoryContext}\n` +
-                "</relevant-memories>",
-              );
+              if (cfg.recallFormat === "function_call") {
+                prependContextParts.push(
+                  `[Auto-invoked: memory_recall("${queryText.slice(0, 80)}")]\n` +
+                  `Found ${memories.length} relevant memories:\n\n${memoryContext}`,
+                );
+              } else {
+                prependContextParts.push(
+                  "<relevant-memories>\nThe following OpenViking memories may be relevant:\n" +
+                    `${memoryContext}\n` +
+                  "</relevant-memories>",
+                );
+              }
             }
           } catch (err) {
             api.logger.warn(`openviking: auto-recall failed: ${String(err)}`);
@@ -551,6 +705,7 @@ const contextEnginePlugin = {
           logger: api.logger,
           getClient,
           resolveAgentId,
+          pendingAlignmentFlags,
         }),
       );
       api.logger.info(

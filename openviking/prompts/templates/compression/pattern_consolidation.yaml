@@ -1,0 +1,38 @@
+metadata:
+  id: "compression.pattern_consolidation"
+  name: "Pattern Consolidation"
+  description: "Consolidate multiple similar case memories into a single reusable pattern"
+  version: "1.0.0"
+  language: "en"
+  category: "compression"
+
+variables:
+  - name: "count"
+    type: "integer"
+    description: "Number of memories being consolidated"
+    required: true
+  - name: "memories"
+    type: "string"
+    description: "Formatted list of related memories"
+    required: true
+  - name: "category"
+    type: "string"
+    description: "Memory category"
+    required: true
+  - name: "output_language"
+    type: "string"
+    description: "Language for output"
+    required: false
+
+template: |
+  Given {{ count }} related memories from category "{{ category }}":
+  {{ memories }}
+
+  Extract a single reusable pattern. Include: when it applies, what to do, what to avoid.
+  Preserve domain-specific terminology from the originals.
+  Output as structured markdown with ## sections.
+
+  {% if output_language %}Output in {{ output_language }}.{% endif %}
+
+llm_config:
+  temperature: 0.0

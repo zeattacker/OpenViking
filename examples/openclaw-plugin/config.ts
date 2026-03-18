@@ -23,6 +23,16 @@ export type MemoryOpenVikingConfig = {
   ingestReplyAssist?: boolean;
   ingestReplyAssistMinSpeakerTurns?: number;
   ingestReplyAssistMinChars?: number;
+  profileInjection?: boolean;
+  recallFormat?: "xml" | "function_call";
+  alignment?: {
+    enabled?: boolean;
+    mode?: "observe_only" | "soft_enforce" | "full_enforce";
+    llmCheckThreshold?: number;
+    driftWindowSize?: number;
+    driftAlertThreshold?: number;
+    driftConsecutiveFlagLimit?: number;
+  };
 };
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:1933";
@@ -36,6 +46,16 @@ const DEFAULT_RECALL_SCORE_THRESHOLD = 0.01;
 const DEFAULT_INGEST_REPLY_ASSIST = true;
 const DEFAULT_INGEST_REPLY_ASSIST_MIN_SPEAKER_TURNS = 2;
 const DEFAULT_INGEST_REPLY_ASSIST_MIN_CHARS = 120;
+const DEFAULT_PROFILE_INJECTION = true;
+const DEFAULT_RECALL_FORMAT = "function_call";
+const DEFAULT_ALIGNMENT = {
+  enabled: false,
+  mode: "observe_only" as const,
+  llmCheckThreshold: 500,
+  driftWindowSize: 20,
+  driftAlertThreshold: 0.65,
+  driftConsecutiveFlagLimit: 5,
+};
 const DEFAULT_LOCAL_CONFIG_PATH = join(homedir(), ".openviking", "ov.conf");
 
 const DEFAULT_AGENT_ID = "default";
@@ -112,6 +132,9 @@ export const memoryOpenVikingConfigSchema = {
         "ingestReplyAssist",
         "ingestReplyAssistMinSpeakerTurns",
         "ingestReplyAssistMinChars",
+        "profileInjection",
+        "recallFormat",
+        "alignment",
       ],
       "openviking config",
     );
@@ -183,6 +206,21 @@ export const memoryOpenVikingConfigSchema = {
           Math.floor(toNumber(cfg.ingestReplyAssistMinChars, DEFAULT_INGEST_REPLY_ASSIST_MIN_CHARS)),
         ),
       ),
+      profileInjection: cfg.profileInjection !== false,
+      recallFormat: (cfg.recallFormat === "xml" ? "xml" : DEFAULT_RECALL_FORMAT) as "xml" | "function_call",
+      alignment: (() => {
+        const raw = (cfg.alignment && typeof cfg.alignment === "object" && !Array.isArray(cfg.alignment))
+          ? cfg.alignment as Record<string, unknown> : {};
+        return {
+          enabled: raw.enabled === true,
+          mode: (["observe_only", "soft_enforce", "full_enforce"].includes(raw.mode as string)
+            ? raw.mode : DEFAULT_ALIGNMENT.mode) as "observe_only" | "soft_enforce" | "full_enforce",
+          llmCheckThreshold: Math.max(100, Math.floor(toNumber(raw.llmCheckThreshold, DEFAULT_ALIGNMENT.llmCheckThreshold))),
+          driftWindowSize: Math.max(5, Math.min(100, Math.floor(toNumber(raw.driftWindowSize, DEFAULT_ALIGNMENT.driftWindowSize)))),
+          driftAlertThreshold: Math.max(0, Math.min(1, toNumber(raw.driftAlertThreshold, DEFAULT_ALIGNMENT.driftAlertThreshold))),
+          driftConsecutiveFlagLimit: Math.max(1, Math.floor(toNumber(raw.driftConsecutiveFlagLimit, DEFAULT_ALIGNMENT.driftConsecutiveFlagLimit))),
+        };
+      })(),
     };
   },
   uiHints: {
@@ -272,6 +310,21 @@ export const memoryOpenVikingConfigSchema = {
       label: "Ingest Min Chars",
       placeholder: String(DEFAULT_INGEST_REPLY_ASSIST_MIN_CHARS),
       help: "Minimum sanitized text length required before ingest reply assist can trigger.",
+      advanced: true,
+    },
+    profileInjection: {
+      label: "Profile Injection",
+      help: "Inject user profile from OpenViking into agent context at session start.",
+    },
+    recallFormat: {
+      label: "Recall Format",
+      placeholder: DEFAULT_RECALL_FORMAT,
+      help: '"xml" uses <relevant-memories> tags; "function_call" uses simulated function call format.',
+      advanced: true,
+    },
+    alignment: {
+      label: "Alignment Check",
+      help: 'Evaluate responses against constraints. Modes: observe_only (log), soft_enforce (block hard), full_enforce (block + correct).',
       advanced: true,
     },
   },

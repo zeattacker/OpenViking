@@ -89,6 +89,21 @@
       "placeholder": "120",
       "help": "Minimum sanitized text length required before ingest reply assist can trigger.",
       "advanced": true
+    },
+    "profileInjection": {
+      "label": "Profile Injection",
+      "help": "Inject user profile from OpenViking into agent context at session start."
+    },
+    "recallFormat": {
+      "label": "Recall Format",
+      "placeholder": "function_call",
+      "help": "xml uses <relevant-memories> tags; function_call uses simulated function call format.",
+      "advanced": true
+    },
+    "alignment": {
+      "label": "Alignment Check",
+      "help": "Evaluate responses against constraints. Modes: observe_only (log), soft_enforce (block hard), full_enforce (block + correct).",
+      "advanced": true
     }
   },
   "configSchema": {
@@ -145,6 +160,24 @@
       },
       "ingestReplyAssistMinChars": {
         "type": "number"
+      },
+      "profileInjection": {
+        "type": "boolean"
+      },
+      "recallFormat": {
+        "type": "string"
+      },
+      "alignment": {
+        "type": "object",
+        "properties": {
+          "enabled": { "type": "boolean" },
+          "mode": { "type": "string" },
+          "llmCheckThreshold": { "type": "number" },
+          "driftWindowSize": { "type": "number" },
+          "driftAlertThreshold": { "type": "number" },
+          "driftConsecutiveFlagLimit": { "type": "number" }
+        },
+        "additionalProperties": false
       }
     }
   }

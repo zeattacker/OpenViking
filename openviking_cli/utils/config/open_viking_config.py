@@ -35,6 +35,30 @@ from .storage_config import StorageConfig
 from .vlm_config import VLMConfig
 
 
+class DistillationConfig(BaseModel):
+    """Configuration for the distillation pipeline (P1)."""
+
+    enabled: bool = Field(default=False, description="Enable distillation pipeline")
+    consolidation_enabled: bool = Field(
+        default=True, description="Enable pattern consolidation"
+    )
+    consolidation_interval_hours: int = Field(
+        default=6, description="Hours between consolidation runs"
+    )
+    consolidation_similarity_threshold: float = Field(
+        default=0.85, description="Cosine similarity threshold for clustering"
+    )
+    consolidation_min_cluster_size: int = Field(
+        default=3, description="Minimum cluster size to trigger consolidation"
+    )
+    decay_enabled: bool = Field(default=True, description="Enable memory decay/archival")
+    decay_check_interval_hours: int = Field(
+        default=24, description="Hours between decay checks"
+    )
+
+    model_config = {"extra": "forbid"}
+
+
 class OpenVikingConfig(BaseModel):
     """Main configuration for OpenViking."""
 
@@ -129,6 +153,10 @@ class OpenVikingConfig(BaseModel):
         ),
     )
 
+    distillation: DistillationConfig = Field(
+        default_factory=lambda: DistillationConfig(), description="Distillation pipeline configuration"
+    )
+
     log: LogConfig = Field(default_factory=lambda: LogConfig(), description="Logging configuration")
 
     model_config = {"arbitrary_types_allowed": True, "extra": "forbid"}
@@ -166,10 +194,19 @@ class OpenVikingConfig(BaseModel):
         if "log" in config_copy:
             log_config_data = config_copy.pop("log")
 
+        # Handle distillation configuration
+        distillation_config_data = None
+        if "distillation" in config_copy:
+            distillation_config_data = config_copy.pop("distillation")
+
         instance = cls(**config_copy)
         # Apply log configuration
         if log_config_data is not None:
             instance.log = LogConfig.from_dict(log_config_data)
+
+        # Apply distillation configuration
+        if distillation_config_data is not None:
+            instance.distillation = DistillationConfig(**distillation_config_data)
 
         # Apply parser configurations
         for parser_type, parser_data in parser_configs.items():

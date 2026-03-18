@@ -79,6 +79,7 @@ class OpenVikingService:
         self._lock_manager: Optional[LockManager] = None
         self._directory_initializer: Optional[DirectoryInitializer] = None
         self._watch_scheduler: Optional[WatchScheduler] = None
+        self._distillation_scheduler: Optional[Any] = None
 
         # Sub-services
         self._fs_service = FSService()
@@ -310,6 +311,31 @@ class OpenVikingService:
         await self._watch_scheduler.start()
         logger.info("WatchScheduler started")
 
+        # Start DistillationScheduler if enabled
+        distill_config = get_openviking_config()
+        if distill_config.distillation.enabled:
+            from openviking.session.distiller import PatternDistiller
+            from openviking.session.distillation_scheduler import DistillationScheduler
+            from openviking.session.memory_archiver import MemoryArchiver
+
+            distiller = PatternDistiller(
+                vikingdb=self._vikingdb_manager,
+                viking_fs=self._viking_fs,
+                similarity_threshold=distill_config.distillation.consolidation_similarity_threshold,
+                min_cluster_size=distill_config.distillation.consolidation_min_cluster_size,
+            )
+            archiver = MemoryArchiver(
+                viking_fs=self._viking_fs, storage=self._vikingdb_manager
+            )
+            self._distillation_scheduler = DistillationScheduler(
+                distiller=distiller,
+                archiver=archiver,
+                config=distill_config,
+                vikingdb=self._vikingdb_manager,
+            )
+            await self._distillation_scheduler.start()
+            logger.info("DistillationScheduler started")
+
         # Wire up sub-services
         self._fs_service.set_viking_fs(self._viking_fs)
         self._relation_service.set_viking_fs(self._viking_fs)
@@ -337,6 +363,11 @@ class OpenVikingService:
 
     async def close(self) -> None:
         """Close OpenViking and release resources."""
+        if self._distillation_scheduler:
+            await self._distillation_scheduler.stop()
+            self._distillation_scheduler = None
+            logger.info("DistillationScheduler stopped")
+
         if self._watch_scheduler:
             await self._watch_scheduler.stop()
             self._watch_scheduler = None

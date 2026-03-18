@@ -18,7 +18,9 @@ from openviking.storage.viking_fs import get_viking_fs
 from openviking_cli.session.user_id import UserIdentifier
 from openviking_cli.utils import get_logger
 
+from .episode_indexer import EpisodeIndexer
 from .memory_deduplicator import DedupDecision, MemoryActionDecision, MemoryDeduplicator
+from .memory_evolver import MemoryEvolver
 from .memory_extractor import (
     CandidateMemory,
     MemoryCategory,
@@ -66,6 +68,7 @@ class SessionCompressor:
         self.vikingdb = vikingdb
         self.extractor = MemoryExtractor()
         self.deduplicator = MemoryDeduplicator(vikingdb=vikingdb)
+        self.episode_indexer = EpisodeIndexer()
         self._pending_semantic_changes: Dict[str, Dict[str, set]] = {}
 
     def _record_semantic_change(
@@ -385,9 +388,10 @@ class SessionCompressor:
                 actions = result.actions or []
                 decision = result.decision
 
-                # Safety net: create+merge should be treated as none.
+                # Safety net: create+merge/evolve should be treated as none.
                 if decision == DedupDecision.CREATE and any(
-                    a.decision == MemoryActionDecision.MERGE for a in actions
+                    a.decision in (MemoryActionDecision.MERGE, MemoryActionDecision.EVOLVE)
+                    for a in actions
                 ):
                     logger.warning(
                         f"Dedup returned create with merge action, normalizing to none: "
@@ -414,6 +418,35 @@ class SessionCompressor:
                                 batch_memories = [
                                     (v, m) for v, m in batch_memories if m.uri != action.memory.uri
                                 ]
+                            else:
+                                stats.skipped += 1
+                        elif action.decision == MemoryActionDecision.EVOLVE:
+                            if candidate.category in MERGE_SUPPORTED_CATEGORIES and viking_fs:
+                                evolver = MemoryEvolver()
+                                if await evolver.evolve(
+                                    candidate, action.memory, viking_fs, ctx=ctx
+                                ):
+                                    stats.merged += 1
+                                    await self._index_memory(
+                                        action.memory, ctx, change_type="modified"
+                                    )
+                                    batch_memories = [
+                                        (v, m)
+                                        for v, m in batch_memories
+                                        if m.uri != action.memory.uri
+                                    ]
+                                    if self.deduplicator.embedder:
+                                        evolved_text = (
+                                            f"{action.memory.abstract} {candidate.content}"
+                                        )
+                                        evolved_embed = self.deduplicator.embedder.embed(
+                                            evolved_text
+                                        )
+                                        batch_memories.append(
+                                            (evolved_embed.dense_vector, action.memory)
+                                        )
+                                else:
+                                    stats.skipped += 1
                             else:
                                 stats.skipped += 1
                         elif action.decision == MemoryActionDecision.MERGE:
@@ -476,6 +509,18 @@ class SessionCompressor:
             used_uris = self._extract_used_uris(messages)
             if used_uris and memories:
                 await self._create_relations(memories, used_uris, ctx=ctx)
+
+            # --- Episode generation ---
+            try:
+                episode = await self.episode_indexer.generate_episode(
+                    messages, user, session_id, ctx
+                )
+                if episode:
+                    await self._index_memory(episode, ctx)
+                    memories.append(episode)
+                    logger.info(f"Episode indexed: {episode.uri}")
+            except Exception as e:
+                logger.error(f"Episode generation failed (non-fatal): {e}", exc_info=True)
 
             await self._flush_semantic_operations(ctx)
 

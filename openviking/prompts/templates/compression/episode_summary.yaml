@@ -1,0 +1,93 @@
+metadata:
+  id: "compression.episode_summary"
+  name: "Episode Summary"
+  description: "Generate a structured episode summary from session conversation messages"
+  version: "1.0.0"
+  language: "en"
+  category: "compression"
+
+variables:
+  - name: "messages"
+    type: "string"
+    description: "Formatted conversation messages"
+    required: true
+  - name: "message_count"
+    type: "integer"
+    description: "Number of messages in the conversation"
+    required: true
+  - name: "agent_id"
+    type: "string"
+    description: "Agent identifier"
+    required: false
+    default: ""
+  - name: "output_language"
+    type: "string"
+    description: "Target language for the episode summary"
+    required: false
+    default: "auto"
+  - name: "max_output_tokens"
+    type: "integer"
+    description: "Maximum tokens for the output"
+    required: false
+    default: 800
+
+template: |
+  You are a conversation summarizer. Generate a structured episode summary from the following conversation.
+
+  Target Output Language: {{ output_language }} ("auto" means detect from the conversation messages)
+
+  {% if agent_id %}
+  Agent ID: {{ agent_id }}
+  {% endif %}
+
+  Message count: {{ message_count }}
+
+  ## Conversation
+  {{ messages }}
+
+  ## Instructions
+
+  Create a structured Markdown summary of this conversation. The summary should be optimized for future search and retrieval.
+
+  **Rules:**
+  - Focus on searchability: use specific proper nouns, technical terms, and concrete details.
+  - Never use relative dates ("today", "yesterday", "last week"). Use absolute dates or omit if unknown.
+  - Preserve specific names, numbers, versions, URLs, and technical terms verbatim.
+  - Be concise but comprehensive. Capture the essence of the conversation.
+  - Write the summary in {{ output_language }} (if "auto", use the dominant language of the conversation).
+
+  **Output format (strict Markdown):**
+
+  ```markdown
+  # Episode: [descriptive title]
+
+  ## Summary
+  [2-4 sentence narrative of what was discussed and accomplished]
+
+  ## Key Topics
+  - [topic 1]
+  - [topic 2]
+  ...
+
+  ## Decisions & Outcomes
+  - [decision or outcome 1]
+  - [decision or outcome 2]
+  ...
+
+  ## Entities Mentioned
+  - [entity 1: brief context]
+  - [entity 2: brief context]
+  ...
+
+  ## Unresolved Items
+  - [unresolved item 1]
+  - [unresolved item 2]
+  ...
+  ```
+
+  If a section has no items, include the heading with "- None" underneath.
+
+  Output ONLY the Markdown summary, no additional text or wrapping.
+
+llm_config:
+  temperature: 0.0

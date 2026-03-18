@@ -116,6 +116,8 @@ class Context:
             return "skill"
         elif "/memories" in self.uri:
             return "memory"
+        elif "/episodes" in self.uri:
+            return "memory"
         else:
             return "resource"
 
@@ -133,6 +135,8 @@ class Context:
             return "entities"
         elif "/events" in self.uri:
             return "events"
+        elif "/episodes" in self.uri:
+            return "episodes"
         return ""
 
     def get_context_type(self) -> str:

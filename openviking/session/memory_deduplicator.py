@@ -40,6 +40,7 @@ class MemoryActionDecision(str, Enum):
 
     MERGE = "merge"  # Merge candidate into existing memory
     DELETE = "delete"  # Delete conflicting existing memory
+    EVOLVE = "evolve"  # Enrich existing memory with new evidence
 
 
 @dataclass
@@ -331,6 +332,7 @@ class MemoryDeduplicator:
         action_map = {
             "merge": MemoryActionDecision.MERGE,
             "delete": MemoryActionDecision.DELETE,
+            "evolve": MemoryActionDecision.EVOLVE,
         }
         similar_by_uri: Dict[str, Context] = {m.uri: m for m in similar_memories}
         actions: List[ExistingMemoryAction] = []
@@ -384,7 +386,10 @@ class MemoryDeduplicator:
         if decision == DedupDecision.SKIP:
             return decision, reason, []
 
-        has_merge_action = any(a.decision == MemoryActionDecision.MERGE for a in actions)
+        has_merge_action = any(
+            a.decision in (MemoryActionDecision.MERGE, MemoryActionDecision.EVOLVE)
+            for a in actions
+        )
 
         # Rule: if any merge exists, ignore create and execute as none.
         if decision == DedupDecision.CREATE and has_merge_action:
