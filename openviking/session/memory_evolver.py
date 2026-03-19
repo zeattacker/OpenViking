@@ -7,6 +7,7 @@ original content. Used when the deduplicator decides EVOLVE — the candidate
 reinforces or supplements an existing memory.
 """
 
+import hashlib
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -19,6 +20,8 @@ from openviking_cli.utils.config import get_openviking_config
 from .memory_extractor import CandidateMemory
 
 logger = get_logger(__name__)
+
+MAX_EVOLUTION_COUNT = 3
 
 
 class MemoryEvolver:
@@ -46,6 +49,18 @@ class MemoryEvolver:
         Returns:
             True on success, False on failure.
         """
+        # Guard: cap evolution count to prevent infinite reprocessing loops.
+        meta = dict(target_memory.meta or {})
+        evolution_count = int(meta.get("evolution_count", 0))
+        if evolution_count >= MAX_EVOLUTION_COUNT:
+            logger.warning(
+                "Skipping evolution for %s: evolution_count %d >= cap %d",
+                target_memory.uri,
+                evolution_count,
+                MAX_EVOLUTION_COUNT,
+            )
+            return False
+
         try:
             existing_content = await viking_fs.read_file(target_memory.uri, ctx=ctx)
         except Exception as e:
@@ -86,6 +101,16 @@ class MemoryEvolver:
 
             if not evolved_content:
                 logger.warning("Evolution LLM returned empty content for %s", target_memory.uri)
+                return False
+
+            # Skip write if content unchanged (prevents reprocessing loop)
+            existing_hash = hashlib.md5((existing_content or "").encode()).hexdigest()
+            evolved_hash = hashlib.md5(evolved_content.encode()).hexdigest()
+            if existing_hash == evolved_hash:
+                logger.info(
+                    "Evolution produced identical content for %s, skipping write",
+                    target_memory.uri,
+                )
                 return False
 
             # Write evolved content back
