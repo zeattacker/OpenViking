@@ -137,6 +137,27 @@ With `input: "multimodal"`, OpenViking can embed text, images (PNG, JPG, etc.), 
 - `vikingdb`: VikingDB Embedding API
 - `jina`: Jina AI Embedding API
 - `voyage`: Voyage AI Embedding API
+- `minimax`: MiniMax Embedding API
+
+**minimax provider example:**
+
+```json
+{
+  "embedding": {
+    "dense": {
+      "provider": "minimax",
+      "api_key": "your-minimax-api-key",
+      "model": "embo-01",
+      "dimension": 1536,
+      "query_param": "query",
+      "document_param": "db",
+      "extra_headers": {
+        "GroupId": "your-group-id"
+      }
+    }
+  }
+}
+```
 
 **vikingdb provider example:**
 
@@ -304,6 +325,7 @@ Vision Language Model for semantic extraction (L0/L1 generation).
 | `thinking` | bool | Enable thinking mode for VolcEngine models (default: `false`) |
 | `max_concurrent` | int | Maximum concurrent semantic LLM calls (default: `100`) |
 | `extra_headers` | object | Custom HTTP headers (for OpenAI-compatible providers, optional) |
+| `stream` | bool | Enable streaming mode (for OpenAI-compatible providers, default: `false`) |
 
 **Available Models**
 
@@ -342,6 +364,24 @@ Common use cases:
 - **OpenRouter**: Requires `HTTP-Referer` and `X-Title` to identify your application
 - **Custom proxies**: Add authentication or tracing headers
 - **API gateways**: Add version or routing identifiers
+
+**Streaming Mode**
+
+For OpenAI-compatible providers that return SSE (Server-Sent Events) format responses, enable `stream` mode:
+
+```json
+{
+  "vlm": {
+    "provider": "openai",
+    "api_key": "your-api-key",
+    "model": "gpt-4o",
+    "api_base": "https://api.example.com/v1",
+    "stream": true
+  }
+}
+```
+
+> **Note**: The OpenAI SDK requires `stream=true` to properly parse SSE responses. When using providers that force SSE format, you must set this option to `true`.
 
 ### code
 
@@ -706,7 +746,8 @@ For details on the lock mechanism, see [Path Locks and Crash Recovery](../concep
     "api_base": "string",
     "thinking": false,
     "max_concurrent": 100,
-    "extra_headers": {}
+    "extra_headers": {},
+    "stream": false
   },
   "rerank": {
     "provider": "volcengine",
