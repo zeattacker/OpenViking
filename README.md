@@ -52,6 +52,9 @@ With OpenViking, developers can build an Agent's brain just like managing local 
 - **Directory Recursive Retrieval** → **Improves Retrieval Effect**: Supports native filesystem retrieval methods, combining directory positioning with semantic search to achieve recursive and precise context acquisition.
 - **Visualized Retrieval Trajectory** → **Observable Context**: Supports visualization of directory retrieval trajectories, allowing users to clearly observe the root cause of issues and guide retrieval logic optimization.
 - **Automatic Session Management** → **Context Self-Iteration**: Automatically compresses content, resource references, tool calls, etc., in conversations, extracting long-term memory, making the Agent smarter with use.
+- **Episodic Memory** → **Cross-Session Recall**: Generates structured episode summaries at session commit, enabling agents to recall "what we discussed" across sessions with semantic search over conversation history. See [docs](./docs/en/concepts/10-episodic-memory.md).
+- **Distillation Pipeline** → **Autonomous Knowledge Evolution**: Consolidates similar memories into reusable patterns, enriches existing memories with new evidence (EVOLVE), and archives stale memories via recall-based decay scoring. See [docs](./docs/en/concepts/11-distillation.md).
+- **Alignment Check** → **Response Safety Evaluation**: Post-response evaluation against safety constraints and agent-specific rules with three modes (observe_only, soft_enforce, full_enforce) and drift detection. See [docs](./docs/en/concepts/12-alignment.md).
 
 ---
 

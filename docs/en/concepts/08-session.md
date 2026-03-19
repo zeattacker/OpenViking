@@ -149,7 +149,12 @@ Write to AGFS → Vectorize
 | Candidate | `create` | Create candidate memory (optionally delete conflicting existing memories first) |
 | Candidate | `none` | Do not create candidate; resolve existing memories by item decisions |
 | Per-existing item | `merge` | Merge candidate content into specified existing memory |
+| Per-existing item | `evolve` | Enrich existing memory with new evidence (preserves original, appends new) |
 | Per-existing item | `delete` | Delete specified conflicting existing memory |
+
+### Episode Generation
+
+After memory extraction, an episode summary is generated from the conversation. See [Episodic Memory](./10-episodic-memory.md).
 
 ## Storage Structure
 
@@ -184,3 +189,6 @@ viking://agent/memories/
 - [Context Types](./02-context-types.md) - Three context types
 - [Context Extraction](./06-extraction.md) - Extraction flow
 - [Context Layers](./03-context-layers.md) - L0/L1/L2 model
+- [Episodic Memory](./10-episodic-memory.md) - Conversation history recall
+- [Distillation Pipeline](./11-distillation.md) - Memory consolidation, evolution, and decay
+- [Alignment Check](./12-alignment.md) - Pre-response alignment evaluation
