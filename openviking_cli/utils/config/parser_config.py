@@ -318,6 +318,8 @@ class AudioConfig(ParserConfig):
     transcription_model: str = "whisper-large-v3"
     language: Optional[str] = None
     extract_metadata: bool = True
+    asr_api_base: Optional[str] = None  # Custom ASR endpoint (e.g. Qwen3 ASR container)
+    asr_api_key: Optional[str] = None  # Custom ASR API key
 
     def validate(self) -> None:
         """

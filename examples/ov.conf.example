@@ -130,7 +130,9 @@
       "enable_transcription": true,
       "transcription_model": "whisper-large-v3",
       "language": null,
-      "extract_metadata": true
+      "extract_metadata": true,
+      "asr_api_base": null,
+      "asr_api_key": null
     },
     "video": {
       "extract_frames": true,

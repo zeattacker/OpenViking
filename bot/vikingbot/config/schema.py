@@ -445,6 +445,7 @@ class WebSearchConfig(BaseModel):
 
     api_key: str = ""  # Brave Search API key
     tavily_api_key: str = ""  # Tavily Search API key
+    searxng_base_url: str = ""  # SearXNG base URL (e.g. http://localhost:8080)
     max_results: int = 5
 
 

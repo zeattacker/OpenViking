@@ -167,9 +167,23 @@ class AudioParser(BaseParser):
             meta={"content_type": "audio", "format": format_str.lower()},
         )
 
+    def _get_asr_client_kwargs(self) -> dict:
+        """Get OpenAI client kwargs for ASR, respecting config and env overrides."""
+        api_key = self.config.asr_api_key or os.getenv("ASR_API_KEY") or os.getenv("OPENAI_API_KEY")
+        base_url = self.config.asr_api_base or os.getenv("ASR_BASE_URL") or os.getenv("OPENAI_BASE_URL")
+        if not api_key:
+            return {}
+        kwargs = {"api_key": api_key}
+        if base_url:
+            kwargs["base_url"] = base_url
+        return kwargs
+
     async def _asr_transcribe(self, audio_bytes: bytes, model: Optional[str]) -> str:
         """
         Generate audio transcription using ASR.
+
+        Supports OpenAI Whisper, Qwen3 ASR, or any OpenAI-compatible ASR endpoint.
+        Configure via AudioConfig.asr_api_base / asr_api_key or ASR_BASE_URL / ASR_API_KEY env vars.
 
         Args:
             audio_bytes: Audio binary data
@@ -177,24 +191,17 @@ class AudioParser(BaseParser):
 
         Returns:
             Audio transcription in markdown format
-
-        TODO: Integrate with actual ASR API (Whisper, etc.)
         """
         model_name = model or self.config.transcription_model
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            logger.error("OPENAI_API_KEY not found, skip audio transcription")
-            return "Audio transcription unavailable: OPENAI_API_KEY is not set."
+        client_kwargs = self._get_asr_client_kwargs()
+        if not client_kwargs:
+            logger.error("No ASR API key found (ASR_API_KEY or OPENAI_API_KEY), skip audio transcription")
+            return "Audio transcription unavailable: no ASR API key configured."
 
         temp_file_path = None
 
         def _sync_transcribe() -> str:
             nonlocal temp_file_path
-            client_kwargs = {"api_key": api_key}
-            base_url = os.getenv("OPENAI_BASE_URL")
-            if base_url:
-                client_kwargs["base_url"] = base_url
-
             client = openai.OpenAI(**client_kwargs)
             with tempfile.NamedTemporaryFile(mode="wb", suffix=".wav", delete=False) as temp_file:
                 temp_file.write(audio_bytes)
@@ -234,19 +241,19 @@ class AudioParser(BaseParser):
         """
         Extract transcription with timestamps from audio using ASR.
 
+        Supports OpenAI Whisper, Qwen3 ASR, or any OpenAI-compatible ASR endpoint.
+
         Args:
             audio_bytes: Audio binary data
             model: ASR model name
 
         Returns:
             Transcript with timestamps in markdown format, or None if not available
-
-        TODO: Integrate with ASR API
         """
         model_name = model or self.config.transcription_model
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            logger.error("OPENAI_API_KEY not found, skip timestamp transcription")
+        client_kwargs = self._get_asr_client_kwargs()
+        if not client_kwargs:
+            logger.error("No ASR API key found, skip timestamp transcription")
             return None
 
         temp_file_path = None
@@ -258,11 +265,6 @@ class AudioParser(BaseParser):
 
         def _sync_transcribe_with_timestamps() -> Optional[str]:
             nonlocal temp_file_path
-            client_kwargs = {"api_key": api_key}
-            base_url = os.getenv("OPENAI_BASE_URL")
-            if base_url:
-                client_kwargs["base_url"] = base_url
-
             client = openai.OpenAI(**client_kwargs)
             with tempfile.NamedTemporaryFile(mode="wb", suffix=".wav", delete=False) as temp_file:
                 temp_file.write(audio_bytes)

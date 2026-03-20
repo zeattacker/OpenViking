@@ -42,6 +42,7 @@ class WebSearchBackendRegistry:
         brave_api_key: Optional[str] = None,
         exa_api_key: Optional[str] = None,
         tavily_api_key: Optional[str] = None,
+        searxng_base_url: Optional[str] = None,
     ) -> Optional[WebSearchBackend]:
         """
         Create a backend instance.
@@ -51,6 +52,7 @@ class WebSearchBackendRegistry:
             brave_api_key: Brave API key (for brave backend)
             exa_api_key: Exa API key (for exa backend)
             tavily_api_key: Tavily API key (for tavily backend)
+            searxng_base_url: SearXNG base URL (for searxng backend)
 
         Returns:
             Backend instance or None
@@ -66,6 +68,8 @@ class WebSearchBackendRegistry:
             return backend_class(api_key=exa_api_key)
         elif name == "tavily":
             return backend_class(api_key=tavily_api_key)
+        elif name == "searxng":
+            return backend_class(base_url=searxng_base_url)
         else:
             return backend_class()
 
@@ -74,16 +78,17 @@ class WebSearchBackendRegistry:
         brave_api_key: Optional[str] = None,
         exa_api_key: Optional[str] = None,
         tavily_api_key: Optional[str] = None,
+        searxng_base_url: Optional[str] = None,
     ) -> WebSearchBackend:
         """
         Auto-select the best available backend.
 
-        Priority: tavily → exa → brave → ddgs
+        Priority: searxng → tavily → exa → brave → ddgs
         """
-        priority = ["tavily", "exa", "brave", "ddgs"]
+        priority = ["searxng", "tavily", "exa", "brave", "ddgs"]
 
         for name in priority:
-            backend = self.create(name, brave_api_key, exa_api_key, tavily_api_key)
+            backend = self.create(name, brave_api_key, exa_api_key, tavily_api_key, searxng_base_url)
             if backend and backend.is_available:
                 return backend
 
