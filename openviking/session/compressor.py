@@ -32,6 +32,10 @@ from .memory_extractor import (
 
 logger = get_logger(__name__)
 
+# Maximum candidates to process per extraction. Limits LLM calls for dedup+merge.
+# Profile and tool/skill candidates are exempt (always processed).
+MAX_DEDUP_CANDIDATES = 5
+
 # Categories that always merge (skip dedup)
 ALWAYS_MERGE_CATEGORIES = {MemoryCategory.PROFILE}
 
@@ -323,6 +327,26 @@ class SessionCompressor:
 
                 if not candidates:
                     return []
+
+                # Cap dedup candidates to limit LLM calls. Profile and tool/skill
+                # categories are exempt (processed separately).
+                dedup_candidates = [
+                    c for c in candidates
+                    if c.category not in ALWAYS_MERGE_CATEGORIES
+                    and c.category not in TOOL_SKILL_CATEGORIES
+                ]
+                exempt_candidates = [
+                    c for c in candidates
+                    if c.category in ALWAYS_MERGE_CATEGORIES
+                    or c.category in TOOL_SKILL_CATEGORIES
+                ]
+                if len(dedup_candidates) > MAX_DEDUP_CANDIDATES:
+                    logger.info(
+                        f"Capping dedup candidates from {len(dedup_candidates)} to "
+                        f"{MAX_DEDUP_CANDIDATES} (profile/tool exempt: {len(exempt_candidates)})"
+                    )
+                    dedup_candidates = dedup_candidates[:MAX_DEDUP_CANDIDATES]
+                candidates = exempt_candidates + dedup_candidates
 
                 tool_skill_count = sum(
                     1 for candidate in candidates if candidate.category in TOOL_SKILL_CATEGORIES
