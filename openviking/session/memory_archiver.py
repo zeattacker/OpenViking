@@ -123,6 +123,7 @@ class MemoryArchiver:
                     "context_type",
                     "parent_uri",
                 ],
+                ctx=ctx,
             )
 
             if not records:

@@ -213,6 +213,7 @@ class PatternDistiller:
                 limit=100,
                 cursor=cursor,
                 output_fields=["uri", "abstract", "dense_vector"],
+                ctx=ctx,
             )
             if not records:
                 break

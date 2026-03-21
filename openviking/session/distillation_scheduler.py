@@ -83,18 +83,24 @@ class DistillationScheduler:
         """Periodically consolidate similar case memories into patterns."""
         distill_cfg = self._config.distillation
         interval_secs = distill_cfg.consolidation_interval_hours * 3600
+        first_run = True
 
         while self._running:
-            try:
-                await asyncio.sleep(interval_secs)
-            except asyncio.CancelledError:
-                break
+            if first_run:
+                # Run immediately on startup, then switch to interval
+                first_run = False
+                await asyncio.sleep(30)  # brief delay for full initialization
+            else:
+                try:
+                    await asyncio.sleep(interval_secs)
+                except asyncio.CancelledError:
+                    break
 
             if not self._running:
                 break
 
             try:
-                scopes = await self._get_active_scopes()
+                scopes = await self._get_agent_scopes()
                 for scope in scopes:
                     ctx = self._make_ctx()
                     result = await self._distiller.consolidate(scope, ctx, dry_run=False)
@@ -113,18 +119,24 @@ class DistillationScheduler:
         """Periodically archive cold memories."""
         distill_cfg = self._config.distillation
         interval_secs = distill_cfg.decay_check_interval_hours * 3600
+        first_run = True
 
         while self._running:
-            try:
-                await asyncio.sleep(interval_secs)
-            except asyncio.CancelledError:
-                break
+            if first_run:
+                # Run immediately on startup, then switch to interval
+                first_run = False
+                await asyncio.sleep(60)  # brief delay for full initialization
+            else:
+                try:
+                    await asyncio.sleep(interval_secs)
+                except asyncio.CancelledError:
+                    break
 
             if not self._running:
                 break
 
             try:
-                scopes = await self._get_active_scopes()
+                scopes = await self._get_decay_scopes()
                 for scope in scopes:
                     ctx = self._make_ctx()
                     memories_uri = f"{scope}/memories/"
@@ -140,11 +152,25 @@ class DistillationScheduler:
                     "[DistillationScheduler] Decay cycle error: %s", e, exc_info=True
                 )
 
-    async def _get_active_scopes(self) -> List[str]:
+    async def _get_agent_scopes(self) -> List[str]:
         """Enumerate active agent spaces.
 
         Returns list of scope URIs like ``viking://agent/{space}``.
+        Used by consolidation (cases → patterns is agent-only).
         """
+        return await self._ls_scopes("viking://agent/")
+
+    async def _get_decay_scopes(self) -> List[str]:
+        """Enumerate scopes eligible for memory decay.
+
+        Currently handles user scopes only. Decay is scope-agnostic:
+        it only checks hotness_score on L2 vectors, so it is safe
+        for user memories.
+        """
+        return await self._ls_scopes("viking://user/")
+
+    async def _ls_scopes(self, root_uri: str) -> List[str]:
+        """List child directories under *root_uri* as scope URIs."""
         try:
             from openviking.storage.viking_fs import get_viking_fs
 
@@ -152,16 +178,16 @@ class DistillationScheduler:
             if not viking_fs:
                 return []
 
-            entries = await viking_fs.ls("viking://agent/")
+            entries = await viking_fs.ls(root_uri)
             scopes = []
             for entry in entries:
                 if isinstance(entry, dict) and entry.get("isDir"):
                     name = entry.get("name", "")
                     if name and not name.startswith("."):
-                        scopes.append(f"viking://agent/{name}")
+                        scopes.append(f"{root_uri}{name}")
             return scopes
         except Exception as e:
-            logger.warning("[DistillationScheduler] Failed to enumerate scopes: %s", e)
+            logger.warning("[DistillationScheduler] Failed to enumerate %s: %s", root_uri, e)
             return []
 
     def _make_ctx(self) -> RequestContext:
