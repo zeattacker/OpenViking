@@ -164,4 +164,11 @@
       "preserve_line_breaks": false
     }
   }
+  "encryption": {
+    "enabled": true,
+    "provider": "local",
+    "local": {
+      "key_file": "~/.openviking/master.key"
+    }
+  }
 }

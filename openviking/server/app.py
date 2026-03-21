@@ -20,6 +20,7 @@ from openviking.server.routers import (
     content_router,
     debug_router,
     filesystem_router,
+    metrics_router,
     observer_router,
     pack_router,
     relations_router,
@@ -32,6 +33,8 @@ from openviking.server.routers import (
 )
 from openviking.service.core import OpenVikingService
 from openviking.service.task_tracker import get_task_tracker
+from openviking.storage.observers import PrometheusObserver
+from openviking.storage.observers.prometheus_observer import set_prometheus_observer
 from openviking_cli.exceptions import OpenVikingError
 from openviking_cli.utils import get_logger
 
@@ -68,15 +71,18 @@ def create_app(
 
         set_service(service)
 
-        # Initialize APIKeyManager after service (needs AGFS)
+        # Initialize APIKeyManager after service (needs VikingFS)
         if config.root_api_key:
             api_key_manager = APIKeyManager(
                 root_key=config.root_api_key,
-                agfs_client=service._agfs,
+                viking_fs=service.viking_fs,
+                encryption_enabled=config.encryption_enabled,
             )
             await api_key_manager.load()
             app.state.api_key_manager = api_key_manager
-            logger.info("APIKeyManager initialized")
+            logger.info(
+                "APIKeyManager initialized with encryption_enabled=%s", config.encryption_enabled
+            )
         else:
             app.state.api_key_manager = None
             logger.warning(
@@ -87,6 +93,13 @@ def create_app(
                 config.host,
             )
 
+        app.state.prometheus_observer = None
+        if config.telemetry.prometheus.enabled:
+            observer = PrometheusObserver()
+            app.state.prometheus_observer = observer
+            set_prometheus_observer(observer)
+            logger.info("Prometheus metrics enabled at /metrics")
+
         # Start TaskTracker cleanup loop
         task_tracker = get_task_tracker()
         task_tracker.start_cleanup_loop()
@@ -94,6 +107,7 @@ def create_app(
         yield
 
         # Cleanup
+        set_prometheus_observer(None)
         task_tracker.stop_cleanup_loop()
         if owns_service and service:
             await service.close()
@@ -179,6 +193,7 @@ def create_app(
     app.include_router(pack_router)
     app.include_router(debug_router)
     app.include_router(observer_router)
+    app.include_router(metrics_router)
     app.include_router(tasks_router)
     app.include_router(bot_router, prefix="/bot/v1")
 

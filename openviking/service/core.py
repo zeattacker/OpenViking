@@ -11,6 +11,7 @@ from typing import Any, Optional
 
 from openviking.agfs_manager import AGFSManager
 from openviking.core.directories import DirectoryInitializer
+from openviking.crypto.config import bootstrap_encryption
 from openviking.resource.watch_scheduler import WatchScheduler
 from openviking.server.identity import RequestContext, Role
 from openviking.service.debug_service import DebugService
@@ -80,6 +81,7 @@ class OpenVikingService:
         self._directory_initializer: Optional[DirectoryInitializer] = None
         self._watch_scheduler: Optional[WatchScheduler] = None
         self._distillation_scheduler: Optional[Any] = None
+        self._encryptor: Optional[Any] = None
 
         # Sub-services
         self._fs_service = FSService()
@@ -237,6 +239,15 @@ class OpenVikingService:
 
         acquire_data_dir_lock(self._config.storage.workspace)
 
+        # Clean up stale RocksDB LOCK files left by crashed processes.
+        # On Windows, these persist after process death and block PersistStore
+        # from opening (see https://github.com/volcengine/OpenViking/issues/650).
+        from openviking.storage.vectordb.utils.stale_lock import (
+            clean_stale_rocksdb_locks,
+        )
+
+        clean_stale_rocksdb_locks(self._config.storage.workspace)
+
         if self._vikingdb_manager is None:
             self._init_storage(
                 self._config.storage,
@@ -248,6 +259,14 @@ class OpenVikingService:
             self._embedder = self._config.embedding.get_embedder()
 
         config = get_openviking_config()
+
+        # Initialize encryption module
+        full_config = config.to_dict()
+        self._encryptor = await bootstrap_encryption(full_config)
+        if self._encryptor:
+            logger.info("Encryption module initialized")
+        else:
+            logger.info("Encryption module not enabled")
 
         # Initialize VikingFS and VikingDB with recorder if enabled
         enable_recorder = os.environ.get("OPENVIKING_ENABLE_RECORDER", "").lower() == "true"
@@ -268,6 +287,7 @@ class OpenVikingService:
             rerank_config=config.rerank,
             vector_store=self._vikingdb_manager,
             enable_recorder=enable_recorder,
+            encryptor=self._encryptor,
         )
         if enable_recorder:
             logger.info("VikingFS IO Recorder enabled")
