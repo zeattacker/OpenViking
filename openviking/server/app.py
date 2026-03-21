@@ -26,6 +26,7 @@ from openviking.server.routers import (
     resources_router,
     search_router,
     sessions_router,
+    stats_router,
     system_router,
     tasks_router,
 )
@@ -174,6 +175,7 @@ def create_app(
     app.include_router(search_router)
     app.include_router(relations_router)
     app.include_router(sessions_router)
+    app.include_router(stats_router)
     app.include_router(pack_router)
     app.include_router(debug_router)
     app.include_router(observer_router)
