@@ -167,3 +167,61 @@ async def debug_distill_dry_run(
             "errors": result.errors,
         },
     )
+
+
+@router.post("/distill/execute")
+async def debug_distill_execute(
+    scope: str = Query(
+        "viking://user/default",
+        description="Scope URI to consolidate",
+    ),
+    subdirectory: str = Query(
+        "entities",
+        description="Memory subdirectory to scan",
+    ),
+    similarity_threshold: Optional[float] = Query(None),
+    min_cluster_size: Optional[int] = Query(None),
+    ctx: RequestContext = Depends(get_request_context),
+):
+    """Execute consolidation on a memory subdirectory (writes pattern files)."""
+    from openviking.session.distiller import PatternDistiller
+    from openviking_cli.utils.config import get_openviking_config
+
+    service = get_service()
+    if not service.vikingdb_manager:
+        return Response(
+            status="error",
+            error=ErrorInfo(code="NO_VECTOR_DB", message="Vector DB not initialized"),
+        )
+
+    config = get_openviking_config()
+    threshold = similarity_threshold or config.distillation.consolidation_similarity_threshold
+    cluster_size = min_cluster_size or config.distillation.consolidation_min_cluster_size
+
+    distiller = PatternDistiller(
+        vikingdb=service.vikingdb_manager,
+        viking_fs=service.viking_fs,
+        similarity_threshold=threshold,
+        min_cluster_size=cluster_size,
+    )
+
+    ctx = RequestContext(user=ctx.user, role=Role.ROOT)
+
+    result = await distiller.consolidate(
+        scope, ctx, dry_run=False, subdirectory=subdirectory,
+    )
+
+    return Response(
+        status="ok",
+        result={
+            "scope": scope,
+            "subdirectory": subdirectory,
+            "similarity_threshold": threshold,
+            "min_cluster_size": cluster_size,
+            "scanned": result.scanned,
+            "clusters_found": result.clusters_found,
+            "patterns_created": result.patterns_created,
+            "pattern_uris": result.pattern_uris,
+            "errors": result.errors,
+        },
+    )
