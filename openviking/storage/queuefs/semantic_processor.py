@@ -76,7 +76,7 @@ class SemanticProcessor(DequeueHandlerBase):
     _request_stats_order: List[str] = []
     _max_cached_stats = 256
 
-    def __init__(self, max_concurrent_llm: int = 100):
+    def __init__(self, max_concurrent_llm: int = 4):
         """
         Initialize SemanticProcessor.
 

@@ -29,7 +29,7 @@ def init_queue_manager(
     timeout: int = 10,
     mount_point: str = "/queue",
     max_concurrent_embedding: int = 10,
-    max_concurrent_semantic: int = 100,
+    max_concurrent_semantic: int = 4,
 ) -> "QueueManager":
     """Initialize QueueManager singleton.
 
@@ -75,7 +75,7 @@ class QueueManager:
         timeout: int = 10,
         mount_point: str = "/queue",
         max_concurrent_embedding: int = 10,
-        max_concurrent_semantic: int = 100,
+        max_concurrent_semantic: int = 4,
     ):
         """Initialize QueueManager."""
         self._agfs = agfs
