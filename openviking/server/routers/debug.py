@@ -8,13 +8,13 @@ Provides debug API for system diagnostics.
 - /api/v1/debug/vector/count - Count vector records
 """
 
-from typing import Optional
+from typing import List, Optional
 
 from fastapi import APIRouter, Depends, Query
 
 from openviking.server.auth import get_request_context
 from openviking.server.dependencies import get_service
-from openviking.server.identity import RequestContext
+from openviking.server.identity import RequestContext, Role
 from openviking.server.models import ErrorInfo, Response
 from openviking.storage import VikingDBManagerProxy
 
@@ -100,3 +100,70 @@ async def debug_vector_count(
 
     count = await proxy.count(filter=filter_expr)
     return Response(status="ok", result={"count": count})
+
+
+@router.post("/distill/dry-run")
+async def debug_distill_dry_run(
+    scope: str = Query(
+        "viking://user/default",
+        description="Scope URI to consolidate (e.g. viking://user/default)",
+    ),
+    subdirectory: str = Query(
+        "entities",
+        description="Memory subdirectory to scan (e.g. entities, cases)",
+    ),
+    similarity_threshold: Optional[float] = Query(
+        None,
+        description="Override cosine similarity threshold (default from config, typically 0.85)",
+    ),
+    min_cluster_size: Optional[int] = Query(
+        None,
+        description="Override minimum cluster size (default from config, typically 3)",
+    ),
+    ctx: RequestContext = Depends(get_request_context),
+):
+    """Dry-run consolidation on a memory subdirectory.
+
+    Returns cluster analysis without writing any files.
+    """
+    from openviking.session.distiller import PatternDistiller
+    from openviking_cli.utils.config import get_openviking_config
+
+    service = get_service()
+    if not service.vikingdb_manager:
+        return Response(
+            status="error",
+            error=ErrorInfo(code="NO_VECTOR_DB", message="Vector DB not initialized"),
+        )
+
+    config = get_openviking_config()
+    threshold = similarity_threshold or config.distillation.consolidation_similarity_threshold
+    cluster_size = min_cluster_size or config.distillation.consolidation_min_cluster_size
+
+    distiller = PatternDistiller(
+        vikingdb=service.vikingdb_manager,
+        viking_fs=service.viking_fs,
+        similarity_threshold=threshold,
+        min_cluster_size=cluster_size,
+    )
+
+    # Override ctx role to ROOT for background operation.
+    ctx = RequestContext(user=ctx.user, role=Role.ROOT)
+
+    result = await distiller.consolidate(
+        scope, ctx, dry_run=True, subdirectory=subdirectory,
+    )
+
+    return Response(
+        status="ok",
+        result={
+            "scope": scope,
+            "subdirectory": subdirectory,
+            "similarity_threshold": threshold,
+            "min_cluster_size": cluster_size,
+            "scanned": result.scanned,
+            "clusters_found": result.clusters_found,
+            "patterns_would_create": result.patterns_created,
+            "errors": result.errors,
+        },
+    )

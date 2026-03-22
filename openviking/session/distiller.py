@@ -58,19 +58,21 @@ class PatternDistiller:
         scope_uri: str,
         ctx: RequestContext,
         dry_run: bool = False,
+        subdirectory: str = "cases",
     ) -> ConsolidationResult:
-        """Main entry point. Scans cases/, clusters similar, consolidates.
+        """Main entry point. Scans a memory subdirectory, clusters similar, consolidates.
 
         Args:
             scope_uri: Agent space URI, e.g. ``viking://agent/{space}``.
             ctx: Request context.
             dry_run: If True, log what would happen without writing.
+            subdirectory: Memory subdirectory to scan (e.g. ``cases``, ``entities``).
 
         Returns:
             Summary of the consolidation operation.
         """
         result = ConsolidationResult()
-        scope_hash = hashlib.md5(scope_uri.encode()).hexdigest()[:12]
+        scope_hash = hashlib.md5(f"{scope_uri}/{subdirectory}".encode()).hexdigest()[:12]
         lock_path = f"/tmp/openviking_distill_{scope_hash}.lock"
 
         # File-lock to prevent concurrent runs on the same scope.
@@ -98,7 +100,7 @@ class PatternDistiller:
             # Touch lock file so other processes see fresh mtime.
             os.utime(lock_fd)
 
-            result = await self._do_consolidate(scope_uri, ctx, dry_run)
+            result = await self._do_consolidate(scope_uri, ctx, dry_run, subdirectory)
         except Exception as e:
             logger.error("[PatternDistiller] Error consolidating %s: %s", scope_uri, e, exc_info=True)
             result.errors += 1
@@ -117,10 +119,11 @@ class PatternDistiller:
         scope_uri: str,
         ctx: RequestContext,
         dry_run: bool,
+        subdirectory: str = "cases",
     ) -> ConsolidationResult:
         """Core consolidation logic."""
         result = ConsolidationResult()
-        cases_uri = f"{scope_uri}/memories/cases/"
+        cases_uri = f"{scope_uri}/memories/{subdirectory}/"
 
         # Step 1: Snapshot — list case files.
         try:
@@ -200,9 +203,13 @@ class PatternDistiller:
         """Fetch (uri, vector, abstract) tuples for case memories.
 
         Uses vikingdb.scroll() with level=2 filter, scoped to the cases URI prefix.
+        Skips chunk URIs (``#chunk_NNNN``) to avoid inflating cluster counts —
+        only the parent file URI is kept.  When a file has multiple chunks,
+        the first chunk's vector is used as the representative.
         """
         from openviking.storage.expr import And
 
+        seen_parents: Dict[str, bool] = {}
         vectors: List[Tuple[str, List[float], str]] = []
         filter_expr = And(conds=[Eq("level", 2)])
         cursor: Optional[str] = None
@@ -212,7 +219,7 @@ class PatternDistiller:
                 filter=filter_expr,
                 limit=100,
                 cursor=cursor,
-                output_fields=["uri", "abstract", "dense_vector"],
+                output_fields=["uri", "abstract", "vector"],
                 ctx=ctx,
             )
             if not records:
@@ -222,11 +229,18 @@ class PatternDistiller:
                 uri = record.get("uri", "")
                 if not uri.startswith(cases_uri_prefix):
                     continue
-                vec = record.get("dense_vector")
+
+                # Normalise chunk URIs to their parent file.
+                parent_uri = uri.split("#")[0]
+                if parent_uri in seen_parents:
+                    continue
+                seen_parents[parent_uri] = True
+
+                vec = record.get("vector")
                 if not vec or not isinstance(vec, list):
                     continue
                 abstract = record.get("abstract", "")
-                vectors.append((uri, vec, abstract))
+                vectors.append((parent_uri, vec, abstract))
 
             cursor = next_cursor
             if cursor is None:

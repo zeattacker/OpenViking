@@ -3,7 +3,7 @@
 import json
 from pathlib import Path
 from threading import Lock
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 
@@ -55,6 +55,13 @@ class DistillationConfig(BaseModel):
     decay_enabled: bool = Field(default=True, description="Enable memory decay/archival")
     decay_check_interval_hours: int = Field(
         default=24, description="Hours between decay checks"
+    )
+    decay_min_age_days: int = Field(
+        default=3, description="Minimum age in days before a memory is eligible for decay"
+    )
+    consolidation_directories: List[str] = Field(
+        default_factory=lambda: ["cases"],
+        description="Memory subdirectories to scan for consolidation (e.g. cases, entities)",
     )
 
     model_config = {"extra": "forbid"}

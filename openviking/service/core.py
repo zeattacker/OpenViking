@@ -110,7 +110,7 @@ class OpenVikingService:
         self,
         config: StorageConfig,
         max_concurrent_embedding: int = 10,
-        max_concurrent_semantic: int = 100,
+        max_concurrent_semantic: int = 4,
     ) -> None:
         """Initialize storage resources."""
         from openviking.utils.agfs_utils import create_agfs_client
@@ -345,7 +345,9 @@ class OpenVikingService:
                 min_cluster_size=distill_config.distillation.consolidation_min_cluster_size,
             )
             archiver = MemoryArchiver(
-                viking_fs=self._viking_fs, storage=self._vikingdb_manager
+                viking_fs=self._viking_fs,
+                storage=self._vikingdb_manager,
+                min_age_days=distill_config.distillation.decay_min_age_days,
             )
             self._distillation_scheduler = DistillationScheduler(
                 distiller=distiller,

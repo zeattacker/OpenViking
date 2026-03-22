@@ -100,16 +100,22 @@ class DistillationScheduler:
                 break
 
             try:
-                scopes = await self._get_agent_scopes()
+                directories = distill_cfg.consolidation_directories or ["cases"]
+                scopes = await self._get_agent_scopes() + await self._get_user_scopes()
                 for scope in scopes:
-                    ctx = self._make_ctx()
-                    result = await self._distiller.consolidate(scope, ctx, dry_run=False)
-                    if result.patterns_created > 0:
-                        logger.info(
-                            "[DistillationScheduler] Consolidated %d patterns for %s",
-                            result.patterns_created,
-                            scope,
+                    for subdir in directories:
+                        ctx = self._make_ctx()
+                        result = await self._distiller.consolidate(
+                            scope, ctx, dry_run=False, subdirectory=subdir,
                         )
+                        if result.patterns_created > 0:
+                            logger.info(
+                                "[DistillationScheduler] Consolidated %d patterns "
+                                "for %s/%s",
+                                result.patterns_created,
+                                scope,
+                                subdir,
+                            )
             except Exception as e:
                 logger.error(
                     "[DistillationScheduler] Consolidation cycle error: %s", e, exc_info=True
@@ -156,9 +162,15 @@ class DistillationScheduler:
         """Enumerate active agent spaces.
 
         Returns list of scope URIs like ``viking://agent/{space}``.
-        Used by consolidation (cases → patterns is agent-only).
         """
         return await self._ls_scopes("viking://agent/")
+
+    async def _get_user_scopes(self) -> List[str]:
+        """Enumerate user spaces for consolidation.
+
+        Returns list of scope URIs like ``viking://user/{id}``.
+        """
+        return await self._ls_scopes("viking://user/")
 
     async def _get_decay_scopes(self) -> List[str]:
         """Enumerate scopes eligible for memory decay.
