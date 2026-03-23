@@ -460,6 +460,11 @@ function extractTextContent(content: unknown): string {
   return parts.join("\n");
 }
 
+export function buildSkillUri(toolName: string): string {
+  const normalized = toolName.toLowerCase().replace(/[\s-]+/g, "_");
+  return `viking://agent/skills/${normalized}`;
+}
+
 function extractToolCalls(content: unknown): Array<{ name: string; input: string; result?: string }> {
   if (!Array.isArray(content)) return [];
   const calls: Array<{ name: string; input: string; result?: string }> = [];

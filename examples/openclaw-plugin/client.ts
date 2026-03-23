@@ -270,12 +270,18 @@ export class OpenVikingClient {
     return result.session_id;
   }
 
-  async addSessionMessage(sessionId: string, role: string, content: string): Promise<void> {
+  async addSessionMessage(
+    sessionId: string,
+    role: string,
+    content: string,
+    parts?: Array<Record<string, unknown>>,
+  ): Promise<void> {
+    const body = parts && parts.length > 0 ? { role, parts } : { role, content };
     await this.request<{ session_id: string }>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
       {
         method: "POST",
-        body: JSON.stringify({ role, content }),
+        body: JSON.stringify(body),
       },
     );
   }
@@ -310,6 +316,13 @@ export class OpenVikingClient {
     await this.request<{ updated: number }>("/api/v1/search/track-recall", {
       method: "POST",
       body: JSON.stringify({ uris }),
+    });
+  }
+
+  async writeFile(uri: string, content: string): Promise<void> {
+    await this.request<{ uri: string }>("/api/v1/fs/write", {
+      method: "POST",
+      body: JSON.stringify({ uri, content }),
     });
   }
 

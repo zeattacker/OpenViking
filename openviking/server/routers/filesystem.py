@@ -117,6 +117,24 @@ async def rm(
     return Response(status="ok", result={"uri": uri})
 
 
+class WriteRequest(BaseModel):
+    """Request model for write."""
+
+    uri: str
+    content: str
+
+
+@router.post("/write")
+async def write(
+    request: WriteRequest,
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Write content to a file."""
+    service = get_service()
+    await service.fs.write_file(request.uri, request.content, ctx=_ctx)
+    return Response(status="ok", result={"uri": request.uri})
+
+
 class MvRequest(BaseModel):
     """Request model for mv."""
 

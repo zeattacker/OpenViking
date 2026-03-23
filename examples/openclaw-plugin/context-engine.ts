@@ -9,7 +9,9 @@ import {
   extractNewTurnTexts,
   extractNewTurnMessages,
   extractLastAssistantText,
+  buildSkillUri,
 } from "./text-utils.js";
+import { createHash } from "crypto";
 import {
   trimForLog,
   toJsonLog,
@@ -132,6 +134,18 @@ function warnOrInfo(logger: Logger, message: string): void {
   logger.info(message);
 }
 
+// Per-session capture throttle to prevent flooding OpenViking with rapid
+// extract calls. Only successful captures (or captures that reach the server
+// but extract 0 memories) trigger cooldown. Connection errors do NOT trigger
+// cooldown so the next turn retries immediately.
+const CAPTURE_COOLDOWN_MS = 60_000; // 60 seconds
+const MAX_CONSECUTIVE_FAILURES = 3;
+const _sessionLastCapture: Map<string, number> = new Map();
+let _consecutiveCaptureFailures = 0;
+
+// Instructions sync: only write when the system prompt hash changes
+const _instructionsSyncedHash: Map<string, string> = new Map();
+
 export function createMemoryOpenVikingContextEngine(params: {
   id: string;
   name: string;
@@ -202,10 +216,61 @@ export function createMemoryOpenVikingContextEngine(params: {
         return;
       }
 
+      // Per-session cooldown: skip if this session captured recently
+      const now = Date.now();
+      const sessionKey = afterTurnParams.sessionId ?? "__global__";
+      const lastCapture = _sessionLastCapture.get(sessionKey) ?? 0;
+      if (now - lastCapture < CAPTURE_COOLDOWN_MS) {
+        logger.info(
+          `openviking: auto-capture skipped (cooldown, ${Math.round((CAPTURE_COOLDOWN_MS - (now - lastCapture)) / 1000)}s remaining)`,
+        );
+        return;
+      }
+
+      // Exponential backoff after consecutive failures
+      if (_consecutiveCaptureFailures >= MAX_CONSECUTIVE_FAILURES) {
+        const backoffMs = CAPTURE_COOLDOWN_MS * Math.pow(2, _consecutiveCaptureFailures - MAX_CONSECUTIVE_FAILURES);
+        if (now - lastCapture < backoffMs) {
+          logger.info(
+            `openviking: auto-capture skipped (backoff after ${_consecutiveCaptureFailures} failures, ${Math.round((backoffMs - (now - lastCapture)) / 1000)}s remaining)`,
+          );
+          return;
+        }
+      }
+
       try {
         await switchClientAgent(afterTurnParams.sessionId, "afterTurn");
 
+        // Sync agent instructions (system prompt) to OpenViking for alignment check
         const messages = afterTurnParams.messages ?? [];
+        try {
+          const systemMsg = messages.find(
+            (m) => (m as Record<string, unknown>).role === "system",
+          ) as Record<string, unknown> | undefined;
+          const sysContent = typeof systemMsg?.content === "string" ? systemMsg.content : "";
+          if (sysContent.length > 20) {
+            const hash = createHash("md5").update(sysContent).digest("hex").slice(0, 16);
+            const cached = _instructionsSyncedHash.get(sessionKey);
+            if (cached !== hash) {
+              const syncClient = await getClient();
+              await syncClient.writeFile(
+                "viking://agent/instructions/system_prompt.md",
+                sysContent,
+              );
+              _instructionsSyncedHash.set(sessionKey, hash);
+              logger.info(`openviking: synced agent instructions (hash=${hash}, len=${sysContent.length})`);
+              // Prune old entries
+              if (_instructionsSyncedHash.size > 200) {
+                const keys = [..._instructionsSyncedHash.keys()];
+                for (const k of keys.slice(0, keys.length - 50)) {
+                  _instructionsSyncedHash.delete(k);
+                }
+              }
+            }
+          }
+        } catch (err) {
+          logger.info(`openviking: instructions sync skipped: ${String(err)}`);
+        }
         if (messages.length === 0) {
           logger.info("openviking: auto-capture skipped (messages=0)");
           return;
@@ -244,18 +309,32 @@ export function createMemoryOpenVikingContextEngine(params: {
         const client = await getClient();
         const sessionId = await client.createSession();
         try {
-          // Ingest structured turns: each role's content goes as a separate session message
+          // Ingest structured turns: send tool calls as structured ToolPart for skill extraction
           if (turns.length > 0) {
             for (const turn of turns) {
-              let content = turn.content;
               if (turn.toolCalls?.length) {
-                const toolSummary = turn.toolCalls
-                  .map((tc) => `[Tool: ${tc.name}]${tc.result ? ` → ${tc.result.slice(0, 200)}` : ""}`)
-                  .join("\n");
-                content = content ? `${content}\n${toolSummary}` : toolSummary;
-              }
-              if (content.trim()) {
-                await client.addSessionMessage(sessionId, turn.role, content.trim());
+                // Build structured parts: text content + tool parts
+                const parts: Array<Record<string, unknown>> = [];
+                if (turn.content.trim()) {
+                  parts.push({ type: "text", text: turn.content.trim() });
+                }
+                for (const tc of turn.toolCalls) {
+                  let toolInput: unknown;
+                  try { toolInput = JSON.parse(tc.input); } catch { toolInput = { raw: tc.input }; }
+                  parts.push({
+                    type: "tool",
+                    tool_name: tc.name,
+                    tool_input: toolInput,
+                    tool_output: (tc.result ?? "").slice(0, 1000),
+                    tool_status: tc.result !== undefined ? "completed" : "pending",
+                    skill_uri: buildSkillUri(tc.name),
+                  });
+                }
+                if (parts.length > 0) {
+                  await client.addSessionMessage(sessionId, turn.role, "", parts);
+                }
+              } else if (turn.content.trim()) {
+                await client.addSessionMessage(sessionId, turn.role, turn.content.trim());
               }
             }
           } else {
@@ -283,11 +362,27 @@ export function createMemoryOpenVikingContextEngine(params: {
                 "Check OpenViking server logs for embedding/extract errors.",
             );
           }
+          // Capture reached the server — set cooldown and reset failures
+          _sessionLastCapture.set(sessionKey, Date.now());
+          _consecutiveCaptureFailures = 0;
+
+          // Prune old session entries to prevent memory leak
+          if (_sessionLastCapture.size > 200) {
+            const cutoff = Date.now() - CAPTURE_COOLDOWN_MS * 10;
+            for (const [k, t] of _sessionLastCapture) {
+              if (t < cutoff) _sessionLastCapture.delete(k);
+            }
+          }
         } finally {
           await client.deleteSession(sessionId).catch(() => {});
         }
       } catch (err) {
-        warnOrInfo(logger, `openviking: auto-capture failed: ${String(err)}`);
+        // Connection/server errors: do NOT set cooldown so next turn retries
+        _consecutiveCaptureFailures++;
+        warnOrInfo(
+          logger,
+          `openviking: auto-capture failed (${_consecutiveCaptureFailures}/${MAX_CONSECUTIVE_FAILURES}): ${String(err)}`,
+        );
       }
 
       // P2: Alignment evaluation (post-delivery)
