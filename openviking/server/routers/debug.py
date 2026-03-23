@@ -225,3 +225,63 @@ async def debug_distill_execute(
             "errors": result.errors,
         },
     )
+
+
+@router.post("/decay/dry-run")
+async def debug_decay_dry_run(
+    scope: str = Query(
+        "viking://user/default/memories/",
+        description="Scope URI to scan for cold memories",
+    ),
+    min_age_days: Optional[int] = Query(
+        None, description="Override minimum age in days (default from config)",
+    ),
+    threshold: Optional[float] = Query(
+        None, description="Override hotness threshold (default 0.1)",
+    ),
+    ctx: RequestContext = Depends(get_request_context),
+):
+    """Dry-run decay scan: show which memories would be archived."""
+    from openviking.session.memory_archiver import MemoryArchiver
+    from openviking_cli.utils.config import get_openviking_config
+
+    service = get_service()
+    if not service.vikingdb_manager:
+        return Response(
+            status="error",
+            error=ErrorInfo(code="NO_VECTOR_DB", message="Vector DB not initialized"),
+        )
+
+    config = get_openviking_config()
+    age = min_age_days if min_age_days is not None else config.distillation.decay_min_age_days
+    thresh = threshold if threshold is not None else MemoryArchiver.DEFAULT_THRESHOLD
+
+    archiver = MemoryArchiver(
+        viking_fs=service.viking_fs,
+        storage=service.vikingdb_manager,
+        threshold=thresh,
+        min_age_days=age,
+    )
+
+    ctx = RequestContext(user=ctx.user, role=Role.ROOT)
+    candidates = await archiver.scan(scope, ctx=ctx)
+
+    return Response(
+        status="ok",
+        result={
+            "scope": scope,
+            "min_age_days": age,
+            "threshold": thresh,
+            "total_candidates": len(candidates),
+            "candidates": [
+                {
+                    "uri": c.uri,
+                    "score": round(c.score, 4),
+                    "active_count": c.active_count,
+                    "updated_at": c.updated_at.isoformat() if c.updated_at else None,
+                    "context_type": c.context_type,
+                }
+                for c in candidates[:50]
+            ],
+        },
+    )
