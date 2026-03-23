@@ -131,7 +131,7 @@ async def write(
 ):
     """Write content to a file."""
     service = get_service()
-    await service.fs.write_file(request.uri, request.content, ctx=_ctx)
+    await service.viking_fs.write_file(request.uri, request.content, ctx=_ctx)
     return Response(status="ok", result={"uri": request.uri})
 
 

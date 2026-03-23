@@ -94,6 +94,11 @@ class SessionCompressor:
         if not parent_uri:
             parent_uri = "/".join(file_uri.rsplit("/", 1)[:-1])
 
+        # If parent_uri points to a file (e.g. from chunk-stripped dedup Context
+        # where parent_uri == uri), derive the actual directory.
+        if parent_uri and parent_uri.endswith(".md"):
+            parent_uri = "/".join(parent_uri.rsplit("/", 1)[:-1])
+
         if not parent_uri:
             logger.warning(f"Could not determine parent URI for {file_uri}, skipping")
             return
