@@ -66,6 +66,15 @@ class DistillationConfig(BaseModel):
         default_factory=lambda: ["cases"],
         description="Memory subdirectories to scan for consolidation (e.g. cases, entities)",
     )
+    semantic_regen_enabled: bool = Field(
+        default=True, description="Enable scheduled full semantic overview regeneration"
+    )
+    semantic_regen_hour_utc: int = Field(
+        default=21, description="Hour (UTC) to run full semantic regen (21 = 04:00 WIB)"
+    )
+    semantic_regen_min_file_delta: int = Field(
+        default=5, description="Minimum file count change to trigger full regen"
+    )
 
     model_config = {"extra": "forbid"}
 

@@ -464,14 +464,33 @@ class SemanticProcessor(DequeueHandlerBase):
                     logger.warning(f"Failed to generate summary for {file_path}: {e}")
                     file_summaries.append({"name": file_name, "summary": ""})
 
-        overview = await self._generate_overview(dir_uri, file_summaries, [])
-        abstract = self._extract_abstract_from_overview(overview)
-        overview, abstract = self._enforce_size_limits(overview, abstract)
+        # Determine if we can use incremental patch mode:
+        # skip expensive LLM overview generation when only a few files changed
+        # and a cached overview already exists.
+        can_patch = (
+            existing_summaries
+            and msg.changes is not None
+            and len(changed_files) <= 5
+        )
+
+        if can_patch:
+            overview = self._build_overview_from_summaries(dir_uri, file_summaries)
+            # Keep existing abstract — 1-2 file changes don't alter the directory theme
+            abstract = self._extract_abstract_from_overview(old_overview) if old_overview else ""
+            overview, abstract = self._enforce_size_limits(overview, abstract)
+            logger.info(
+                f"Patched overview for {dir_uri} (incremental, "
+                f"{len(changed_files)} changes, {len(file_summaries)} total)"
+            )
+        else:
+            overview = await self._generate_overview(dir_uri, file_summaries, [])
+            abstract = self._extract_abstract_from_overview(overview)
+            overview, abstract = self._enforce_size_limits(overview, abstract)
+            logger.info(f"Generated full overview for {dir_uri} via LLM")
 
         try:
             await viking_fs.write_file(f"{dir_uri}/.overview.md", overview, ctx=ctx)
             await viking_fs.write_file(f"{dir_uri}/.abstract.md", abstract, ctx=ctx)
-            logger.info(f"Generated abstract.md and overview.md for {dir_uri}")
         except Exception as e:
             logger.error(f"Failed to write abstract/overview for {dir_uri}: {e}")
             return
@@ -807,6 +826,25 @@ class SemanticProcessor(DequeueHandlerBase):
                     content_lines.append(line.strip())
 
         return "\n".join(content_lines).strip()
+
+    @staticmethod
+    def _build_overview_from_summaries(
+        dir_uri: str, file_summaries: List[Dict[str, str]]
+    ) -> str:
+        """Build overview markdown from file summaries without LLM.
+
+        Produces the indexed format ``[N] filename: summary`` which
+        ``_parse_overview_md`` can parse back for future incremental runs.
+        """
+        dir_name = dir_uri.rstrip("/").split("/")[-1]
+        lines = [f"# {dir_name}\n"]
+        for idx, item in enumerate(file_summaries, 1):
+            summary = item.get("summary", "").strip()
+            if summary:
+                lines.append(f"[{idx}] {item['name']}: {summary}")
+            else:
+                lines.append(f"[{idx}] {item['name']}: (no summary)")
+        return "\n".join(lines)
 
     def _enforce_size_limits(self, overview: str, abstract: str) -> Tuple[str, str]:
         """Enforce max size limits on overview and abstract."""

@@ -7,7 +7,8 @@ Modeled after WatchScheduler's asyncio periodic task pattern.
 """
 
 import asyncio
-from typing import Any, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional
 
 from openviking.server.identity import RequestContext, Role
 from openviking.session.distiller import PatternDistiller
@@ -59,6 +60,14 @@ class DistillationScheduler:
                 "[DistillationScheduler] Decay loop started "
                 "(interval=%dh)",
                 distill_cfg.decay_check_interval_hours,
+            )
+
+        if distill_cfg.semantic_regen_enabled:
+            self._tasks.append(asyncio.create_task(self._semantic_regen_loop()))
+            logger.info(
+                "[DistillationScheduler] Semantic regen loop started "
+                "(daily at %02d:00 UTC)",
+                distill_cfg.semantic_regen_hour_utc,
             )
 
     async def stop(self) -> None:
@@ -214,6 +223,120 @@ class DistillationScheduler:
         except Exception as e:
             logger.warning("[DistillationScheduler] Failed to enumerate %s: %s", root_uri, e)
             return []
+
+    _last_file_counts: Dict[str, int] = {}
+
+    async def _semantic_regen_loop(self) -> None:
+        """Full semantic overview regeneration at a fixed daily time.
+
+        Runs at ``semantic_regen_hour_utc`` (default 21:00 UTC = 04:00 WIB).
+        Only triggers full regen for directories whose file count changed by
+        at least ``semantic_regen_min_file_delta`` since the last run.
+        """
+        distill_cfg = self._config.distillation
+        target_hour = distill_cfg.semantic_regen_hour_utc
+        min_delta = distill_cfg.semantic_regen_min_file_delta
+
+        while self._running:
+            # Sleep until next target time
+            now = datetime.now(timezone.utc)
+            target = now.replace(hour=target_hour, minute=0, second=0, microsecond=0)
+            if now >= target:
+                target += timedelta(days=1)
+            wait_secs = (target - now).total_seconds()
+            logger.info(
+                "[DistillationScheduler] Semantic regen sleeping %.0fs until %s UTC",
+                wait_secs,
+                target.strftime("%Y-%m-%d %H:%M"),
+            )
+
+            try:
+                await asyncio.sleep(wait_secs)
+            except asyncio.CancelledError:
+                break
+
+            if not self._running:
+                break
+
+            try:
+                await self._run_semantic_regen(min_delta)
+            except Exception as e:
+                logger.error(
+                    "[DistillationScheduler] Semantic regen error: %s", e, exc_info=True
+                )
+
+    async def _run_semantic_regen(self, min_delta: int) -> None:
+        """Check file counts and enqueue full regen for changed directories."""
+        from openviking.storage.queuefs.queue_manager import get_queue_manager
+        from openviking.storage.queuefs.semantic_msg import SemanticMsg
+        from openviking.storage.viking_fs import get_viking_fs
+
+        viking_fs = get_viking_fs()
+        if not viking_fs:
+            return
+
+        scopes = await self._get_user_scopes()
+        # Memory subdirectories + episodes
+        subdirs = ["memories/entities", "memories/events", "memories/preferences", "episodes"]
+
+        for scope in scopes:
+            for subdir in subdirs:
+                dir_uri = f"{scope}/{subdir}"
+                try:
+                    entries = await viking_fs.ls(dir_uri)
+                    file_count = sum(
+                        1 for e in entries
+                        if isinstance(e, dict)
+                        and not e.get("isDir", False)
+                        and not e.get("name", "").startswith(".")
+                    )
+                except Exception:
+                    continue
+
+                prev = self._last_file_counts.get(dir_uri, 0)
+                delta = abs(file_count - prev)
+                self._last_file_counts[dir_uri] = file_count
+
+                if prev == 0:
+                    # First run — record baseline, skip regen
+                    logger.info(
+                        "[DistillationScheduler] Semantic regen baseline: %s = %d files",
+                        dir_uri, file_count,
+                    )
+                    continue
+
+                if delta < min_delta:
+                    logger.debug(
+                        "[DistillationScheduler] Semantic regen skip %s (delta=%d < %d)",
+                        dir_uri, delta, min_delta,
+                    )
+                    continue
+
+                logger.info(
+                    "[DistillationScheduler] Semantic regen triggered for %s "
+                    "(files: %d → %d, delta=%d)",
+                    dir_uri, prev, file_count, delta,
+                )
+
+                # Enqueue with changes=None to force full LLM regen
+                queue_mgr = get_queue_manager()
+                semantic_queue = queue_mgr.get_queue(queue_mgr.SEMANTIC)
+                ctx = self._make_ctx()
+                sem_msg = SemanticMsg(
+                    uri=dir_uri,
+                    context_type="memory",
+                    recursive=True,
+                    account_id=ctx.user.account_id,
+                    user_id=ctx.user.user_id,
+                    agent_id=ctx.user.agent_id,
+                    role="root",
+                    changes=None,  # Force full regen
+                )
+                await semantic_queue.enqueue(sem_msg)
+                logger.info(
+                    "[DistillationScheduler] Enqueued full semantic regen for %s",
+                    dir_uri,
+                )
 
     def _make_ctx(self) -> RequestContext:
         """Create a RequestContext for background operations."""
