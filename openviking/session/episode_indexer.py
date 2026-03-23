@@ -37,6 +37,44 @@ class EpisodeIndexer:
         else:
             return 1200
 
+    # Patterns that indicate trivial/automated conversations not worth
+    # generating an episode for.  Checked case-insensitively against the
+    # formatted message text.
+    _TRIVIAL_PATTERNS = [
+        "heartbeat",
+        "heartbeat_ok",
+        "heartteat_ok",
+        "health check",
+        "health_check",
+        "system check",
+        "system status",
+        "ping",
+    ]
+
+    # Minimum characters of substantive content (after formatting) to
+    # be considered a meaningful conversation.
+    _MIN_CONTENT_CHARS = 200
+
+    @staticmethod
+    def _is_trivial(formatted_messages: str, message_count: int) -> bool:
+        """Return True if the conversation is too trivial for an episode.
+
+        Filters out heartbeats, system checks, and very short exchanges
+        that are typically from cron jobs or agent initialization.
+        """
+        text_lower = formatted_messages.lower()
+
+        # Check for trivial keyword patterns
+        for pattern in EpisodeIndexer._TRIVIAL_PATTERNS:
+            if pattern in text_lower:
+                return True
+
+        # Very short conversations with minimal content
+        if message_count <= 3 and len(formatted_messages) < EpisodeIndexer._MIN_CONTENT_CHARS:
+            return True
+
+        return False
+
     @staticmethod
     def _format_messages(messages: List[Message]) -> str:
         """Format messages as [role]: content for the prompt."""
@@ -87,6 +125,12 @@ class EpisodeIndexer:
         formatted_messages = self._format_messages(messages)
         if not formatted_messages.strip():
             logger.debug("Skipping episode generation: no message content")
+            return None
+
+        # Skip trivial conversations: heartbeats, system checks, short
+        # cron-triggered sessions that don't contain meaningful dialogue.
+        if self._is_trivial(formatted_messages, message_count):
+            logger.info("Skipping episode generation: trivial conversation")
             return None
 
         max_output_tokens = self._compute_token_budget(message_count)
