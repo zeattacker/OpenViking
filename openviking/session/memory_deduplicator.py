@@ -18,6 +18,8 @@ from openviking.models.embedder.base import EmbedResult
 from openviking.prompts import render_prompt
 from openviking.server.identity import RequestContext
 from openviking.storage import VikingDBManager
+
+_CHUNK_RE = re.compile(r"#chunk_\d+$")
 from openviking.telemetry import get_current_telemetry
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config import get_openviking_config
@@ -200,9 +202,24 @@ class MemoryDeduplicator:
                     # Reconstruct Context object
                     context = Context.from_dict(result)
                     if context:
+                        # Strip chunk fragment from URI — chunks are vector-only,
+                        # the filesystem file is the parent URI without #chunk_NNNN.
+                        context.uri = _CHUNK_RE.sub("", context.uri)
                         # Keep retrieval score for later destructive-action guardrails.
                         context.meta = {**(context.meta or {}), "_dedup_score": score}
                         similar.append(context)
+
+            # Deduplicate results pointing to the same parent file (multiple
+            # chunks of one file may match).  Keep the highest-scored entry.
+            seen_uris: dict[str, int] = {}
+            deduped: list[Context] = []
+            for ctx_obj in similar:
+                if ctx_obj.uri in seen_uris:
+                    continue
+                seen_uris[ctx_obj.uri] = len(deduped)
+                deduped.append(ctx_obj)
+            similar = deduped
+
             logger.debug("Dedup similar memories after threshold=%d", len(similar))
 
             # Include batch-internal memories that are similar (#687).

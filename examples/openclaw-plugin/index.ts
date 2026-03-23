@@ -637,7 +637,9 @@ const contextEnginePlugin = {
 
                 if (memories.length > 0) {
                   // Track auto-recalled URIs (fire-and-forget)
-                  const autoRecalledUris = memories.map((m: FindResultItem) => m.uri);
+                  const autoRecalledUris = memories.map((m: FindResultItem) =>
+                    m.uri.replace(/#chunk_\d+$/, ""),
+                  );
                   client.trackRecall(autoRecalledUris).catch((err) => {
                     api.logger.warn(`openviking: auto-recall tracking failed: ${String(err)}`);
                   });
@@ -646,7 +648,10 @@ const contextEnginePlugin = {
                     memories.map(async (item: FindResultItem) => {
                       if (item.level === 2) {
                         try {
-                          const content = await client.read(item.uri);
+                          // Strip #chunk_NNNN fragment — chunks are vector-only,
+                          // the readable file is the parent URI.
+                          const readUri = item.uri.replace(/#chunk_\d+$/, "");
+                          const content = await client.read(readUri);
                           if (content && typeof content === "string" && content.trim()) {
                             return `- [${item.category ?? "memory"}] ${content.trim()}`;
                           }
