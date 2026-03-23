@@ -148,11 +148,21 @@ class DistillationScheduler:
                 scopes = await self._get_decay_scopes()
                 for scope in scopes:
                     ctx = self._make_ctx()
+                    # Decay memories
                     memories_uri = f"{scope}/memories/"
                     result = await self._archiver.scan_and_archive(memories_uri, ctx=ctx)
                     if result.archived > 0:
                         logger.info(
                             "[DistillationScheduler] Archived %d cold memories for %s",
+                            result.archived,
+                            scope,
+                        )
+                    # Decay episodes
+                    episodes_uri = f"{scope}/episodes/"
+                    result = await self._archiver.scan_and_archive(episodes_uri, ctx=ctx)
+                    if result.archived > 0:
+                        logger.info(
+                            "[DistillationScheduler] Archived %d cold episodes for %s",
                             result.archived,
                             scope,
                         )

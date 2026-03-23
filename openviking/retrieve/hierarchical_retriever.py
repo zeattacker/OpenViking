@@ -593,6 +593,7 @@ class HierarchicalRetriever:
         if context_type is None:
             return [
                 f"viking://user/{user_space}/memories",
+                f"viking://user/{user_space}/episodes",
                 f"viking://agent/{agent_space}/memories",
                 "viking://resources",
                 f"viking://agent/{agent_space}/skills",
@@ -600,6 +601,7 @@ class HierarchicalRetriever:
         elif context_type == ContextType.MEMORY:
             return [
                 f"viking://user/{user_space}/memories",
+                f"viking://user/{user_space}/episodes",
                 f"viking://agent/{agent_space}/memories",
             ]
         elif context_type == ContextType.RESOURCE:
