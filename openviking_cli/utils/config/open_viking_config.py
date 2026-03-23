@@ -59,6 +59,9 @@ class DistillationConfig(BaseModel):
     decay_min_age_days: int = Field(
         default=3, description="Minimum age in days before a memory is eligible for decay"
     )
+    decay_threshold: float = Field(
+        default=0.25, description="Hotness score threshold below which memories are archived (0.0-1.0)"
+    )
     consolidation_directories: List[str] = Field(
         default_factory=lambda: ["cases"],
         description="Memory subdirectories to scan for consolidation (e.g. cases, entities)",

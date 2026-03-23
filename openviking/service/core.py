@@ -348,6 +348,7 @@ class OpenVikingService:
                 viking_fs=self._viking_fs,
                 storage=self._vikingdb_manager,
                 min_age_days=distill_config.distillation.decay_min_age_days,
+                threshold=distill_config.distillation.decay_threshold,
             )
             self._distillation_scheduler = DistillationScheduler(
                 distiller=distiller,

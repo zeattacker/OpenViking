@@ -101,7 +101,10 @@ class DistillationScheduler:
 
             try:
                 directories = distill_cfg.consolidation_directories or ["cases"]
-                scopes = await self._get_agent_scopes() + await self._get_user_scopes()
+                # Skip agent scopes — too few cases per agent to form meaningful
+                # clusters.  Consolidation is only valuable for user-scoped
+                # memories (entities, events) where file counts grow large.
+                scopes = await self._get_user_scopes()
                 for scope in scopes:
                     for subdir in directories:
                         ctx = self._make_ctx()
