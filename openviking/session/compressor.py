@@ -39,10 +39,11 @@ MAX_DEDUP_CANDIDATES = 5
 # Categories that always merge (skip dedup)
 ALWAYS_MERGE_CATEGORIES = {MemoryCategory.PROFILE}
 
-# Categories that support MERGE decision
+# Categories that support MERGE/EVOLVE decision
 MERGE_SUPPORTED_CATEGORIES = {
     MemoryCategory.PREFERENCES,
     MemoryCategory.ENTITIES,
+    MemoryCategory.EVENTS,
     MemoryCategory.PATTERNS,
 }
 
@@ -74,7 +75,7 @@ class SessionCompressor:
         self.vikingdb = vikingdb
         self.extractor = MemoryExtractor()
         self.deduplicator = MemoryDeduplicator(vikingdb=vikingdb)
-        self.episode_indexer = EpisodeIndexer()
+        self.episode_indexer = EpisodeIndexer(vikingdb=vikingdb)
         self._pending_semantic_changes: Dict[str, Dict[str, set]] = {}
 
     def _record_semantic_change(

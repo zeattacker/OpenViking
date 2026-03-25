@@ -165,12 +165,6 @@ class OpenVikingConfig(BaseModel):
 
     default_search_limit: int = Field(default=3, description="Default number of results to return")
 
-    enable_memory_decay: bool = Field(default=True, description="Enable automatic memory decay")
-
-    memory_decay_check_interval: int = Field(
-        default=3600, description="Interval (seconds) to check for expired memories"
-    )
-
     language_fallback: str = Field(
         default="en",
         description=(

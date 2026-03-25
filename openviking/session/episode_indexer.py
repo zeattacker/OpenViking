@@ -5,6 +5,7 @@ Episode Indexer for OpenViking.
 
 Generates structured episode summaries from session conversations and stores them
 as searchable episodes alongside existing memories.
+Includes score-based dedup to prevent near-duplicate episodes.
 """
 
 from datetime import datetime, timezone
@@ -21,9 +22,25 @@ from openviking_cli.utils.config import get_openviking_config
 
 logger = get_logger(__name__)
 
+# Score-based episode dedup thresholds (no LLM needed).
+# Derived from empirical pairwise tests on known duplicate/non-duplicate memories.
+EPISODE_SKIP_THRESHOLD = 0.92   # Near-exact duplicate conversation → skip
+EPISODE_EVOLVE_THRESHOLD = 0.75  # Same topic, new details → evolve (append)
+
 
 class EpisodeIndexer:
     """Generates and indexes episode summaries from session conversations."""
+
+    def __init__(self, vikingdb=None):
+        """Initialize episode indexer.
+
+        Args:
+            vikingdb: VikingDBManager for episode dedup vector search.
+                      If None, dedup is skipped (always creates).
+        """
+        self._vikingdb = vikingdb
+        config = get_openviking_config()
+        self._embedder = config.embedding.get_embedder()
 
     @staticmethod
     def _compute_token_budget(message_count: int) -> int:
@@ -95,6 +112,115 @@ class EpisodeIndexer:
             if content:
                 lines.append(f"[{role}]: {content}")
         return "\n\n".join(lines)
+
+    async def _find_similar_episode(
+        self,
+        episode_content: str,
+        user: Optional[UserIdentifier],
+        ctx: RequestContext,
+    ) -> tuple[Optional[Context], float]:
+        """Find the most similar existing episode using vector search.
+
+        Returns (similar_episode, score) or (None, 0.0) if no similar episode.
+        """
+        if not self._vikingdb or not self._embedder:
+            return None, 0.0
+
+        try:
+            from openviking.models.embedder.base import EmbedResult
+            from openviking.storage.expr import And, Eq, In
+
+            embed_result: EmbedResult = self._embedder.embed(
+                episode_content[:2000], is_query=True,
+            )
+            query_vector = embed_result.dense_vector
+
+            user_space = user.user_space_name() if user else "default"
+            episodes_prefix = f"viking://user/{user_space}/episodes/"
+
+            conds = [
+                Eq("level", 2),
+                Eq("account_id", ctx.account_id),
+                In("uri", [episodes_prefix]),
+            ]
+            owner_space = user.user_space_name() if user else None
+            if owner_space:
+                conds.append(Eq("owner_space", owner_space))
+
+            results = await self._vikingdb.search(
+                query_vector=query_vector,
+                filter=And(conds),
+                limit=3,
+                ctx=ctx,
+            )
+
+            if not results:
+                return None, 0.0
+
+            # Find the top-scoring non-archived result
+            best_score = 0.0
+            best_ctx = None
+            for r in results:
+                uri = r.get("uri", "")
+                if "/_archive/" in uri:
+                    continue
+                score = float(r.get("_score", r.get("score", 0)) or 0)
+                if score > best_score:
+                    best_score = score
+                    best_ctx = Context.from_dict(r)
+
+            return best_ctx, best_score
+
+        except Exception as e:
+            logger.debug("Episode dedup search failed (non-fatal): %s", e)
+            return None, 0.0
+
+    async def _evolve_episode(
+        self,
+        existing: Context,
+        new_content: str,
+        ctx: RequestContext,
+    ) -> Optional[Context]:
+        """Append new episode content to an existing episode file."""
+        viking_fs = get_viking_fs()
+        if not viking_fs:
+            return None
+
+        try:
+            old_content = await viking_fs.read_file(existing.uri, ctx=ctx)
+            if isinstance(old_content, bytes):
+                old_content = old_content.decode("utf-8", errors="replace")
+        except Exception as e:
+            logger.warning("Cannot read existing episode %s: %s", existing.uri, e)
+            return None
+
+        # Append a separator + new content
+        timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        evolved_content = (
+            f"{old_content}\n\n"
+            f"---\n"
+            f"## Follow-up ({timestamp})\n\n"
+            f"{new_content}"
+        )
+
+        try:
+            await viking_fs.write_file(existing.uri, evolved_content, ctx=ctx)
+        except Exception as e:
+            logger.error("Failed to write evolved episode %s: %s", existing.uri, e)
+            return None
+
+        # Update abstract and vectorize text
+        existing.set_vectorize(Vectorize(text=evolved_content))
+        meta = dict(existing.meta or {})
+        meta["evolution_count"] = int(meta.get("evolution_count", 0)) + 1
+        meta["last_confirmed"] = datetime.now(timezone.utc).isoformat()
+        existing.meta = meta
+
+        logger.info(
+            "Evolved episode %s (evolution_count=%d)",
+            existing.uri, meta["evolution_count"],
+        )
+        return existing
 
     async def generate_episode(
         self,
@@ -172,6 +298,27 @@ class EpisodeIndexer:
             return None
 
         episode_content = episode_content.strip()
+
+        # --- Episode dedup: score-based, no LLM needed ---
+        similar_ep, score = await self._find_similar_episode(
+            episode_content, user, ctx,
+        )
+        if similar_ep and score >= EPISODE_SKIP_THRESHOLD:
+            logger.info(
+                "Episode dedup: SKIP (score=%.4f >= %.2f) similar=%s",
+                score, EPISODE_SKIP_THRESHOLD, similar_ep.uri,
+            )
+            return None
+
+        if similar_ep and score >= EPISODE_EVOLVE_THRESHOLD:
+            logger.info(
+                "Episode dedup: EVOLVE (score=%.4f >= %.2f) into=%s",
+                score, EPISODE_EVOLVE_THRESHOLD, similar_ep.uri,
+            )
+            evolved = await self._evolve_episode(similar_ep, episode_content, ctx)
+            return evolved  # May be None on failure; caller handles it
+
+        # --- No duplicate found or score too low: create new episode ---
 
         # Build episode URI
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")

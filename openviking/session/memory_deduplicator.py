@@ -69,8 +69,14 @@ class DedupResult:
 class MemoryDeduplicator:
     """Handles memory deduplication with LLM decision making."""
 
-    SIMILARITY_THRESHOLD = 0.0  # Vector similarity threshold for pre-filtering
+    SIMILARITY_THRESHOLD = 0.50  # Vector similarity threshold for pre-filtering
     MAX_PROMPT_SIMILAR_MEMORIES = 5  # Number of similar memories sent to LLM
+
+    # Score-based fallback thresholds when LLM is unavailable.
+    # Derived from empirical pairwise tests: known duplicates score 0.57-1.0,
+    # known non-duplicates max at 0.55.
+    FALLBACK_SKIP_THRESHOLD = 0.92  # Near-exact duplicate, safe to skip
+    FALLBACK_EVOLVE_THRESHOLD = 0.75  # Same topic, evolve is non-destructive
 
     _USER_CATEGORIES = {"preferences", "entities", "events"}
     _AGENT_CATEGORIES = {"cases", "patterns", "tools", "skills"}
@@ -243,6 +249,51 @@ class MemoryDeduplicator:
             logger.warning(f"Vector search failed: {e}")
             return [], query_vector
 
+    def _score_based_fallback(
+        self,
+        similar_memories: List[Context],
+        reason_prefix: str,
+    ) -> tuple[DedupDecision, str, List[ExistingMemoryAction]]:
+        """Score-based dedup fallback when LLM is unavailable.
+
+        Uses the top similarity score from vector pre-filtering to make a
+        conservative decision:
+        - >= 0.92: near-exact duplicate → SKIP
+        - 0.75-0.92: same topic → NONE + EVOLVE (non-destructive append)
+        - < 0.75: gray zone → CREATE (safer than losing info)
+        """
+        top_score = max(
+            (float((m.meta or {}).get("_dedup_score", 0)) for m in similar_memories),
+            default=0.0,
+        )
+        top_mem = max(
+            similar_memories,
+            key=lambda m: float((m.meta or {}).get("_dedup_score", 0)),
+            default=None,
+        )
+
+        if top_score >= self.FALLBACK_SKIP_THRESHOLD:
+            return (
+                DedupDecision.SKIP,
+                f"{reason_prefix}, auto-skip (score={top_score:.4f})",
+                [],
+            )
+        if top_score >= self.FALLBACK_EVOLVE_THRESHOLD and top_mem is not None:
+            return (
+                DedupDecision.NONE,
+                f"{reason_prefix}, auto-evolve (score={top_score:.4f})",
+                [ExistingMemoryAction(
+                    memory=top_mem,
+                    decision=MemoryActionDecision.EVOLVE,
+                    reason=f"Score-based evolve (score={top_score:.4f})",
+                )],
+            )
+        return (
+            DedupDecision.CREATE,
+            f"{reason_prefix}, auto-create (score={top_score:.4f})",
+            [],
+        )
+
     async def _llm_decision(
         self,
         candidate: CandidateMemory,
@@ -251,8 +302,9 @@ class MemoryDeduplicator:
         """Use LLM to decide deduplication action."""
         vlm = get_openviking_config().vlm
         if not vlm or not vlm.is_available():
-            # Without LLM, default to CREATE (conservative)
-            return DedupDecision.CREATE, "LLM not available, defaulting to CREATE", []
+            return self._score_based_fallback(
+                similar_memories, "LLM not available"
+            )
 
         # Format existing memories for prompt
         existing_formatted = []
@@ -309,7 +361,9 @@ class MemoryDeduplicator:
 
         except Exception as e:
             logger.warning(f"LLM dedup decision failed: {e}")
-            return DedupDecision.CREATE, f"LLM failed: {e}", []
+            return self._score_based_fallback(
+                similar_memories, f"LLM failed: {e}"
+            )
 
     def _parse_decision_payload(
         self,

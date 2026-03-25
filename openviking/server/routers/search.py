@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Search endpoints for OpenViking HTTP Server."""
 
+import asyncio
 import math
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
@@ -14,7 +15,51 @@ from openviking.server.identity import RequestContext
 from openviking.server.models import Response
 from openviking.server.telemetry import run_operation
 from openviking.telemetry import TelemetryRequest
+from openviking_cli.utils import get_logger
 
+logger = get_logger(__name__)
+
+
+def _track_recall_background(ctx: RequestContext, uris: List[str]) -> None:
+    """Fire-and-forget: increment active_count for recalled URIs."""
+    if not uris:
+        return
+
+    async def _do_track() -> None:
+        try:
+            service = get_service()
+            if service.vikingdb_manager:
+                await service.vikingdb_manager.increment_active_count(ctx, uris)
+        except Exception as e:
+            logger.debug("Background track-recall failed: %s", e)
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.create_task(_do_track())
+    except RuntimeError:
+        pass
+
+
+def _extract_uris_from_result(result: Any) -> List[str]:
+    """Extract unique URIs from a FindResult (dict or object)."""
+    uris: List[str] = []
+    seen: set = set()
+
+    if isinstance(result, dict):
+        for key in ("memories", "resources", "skills"):
+            for item in result.get(key, []):
+                uri = item.get("uri", "") if isinstance(item, dict) else getattr(item, "uri", "")
+                if uri and uri not in seen:
+                    uris.append(uri)
+                    seen.add(uri)
+    else:
+        for key in ("memories", "resources", "skills"):
+            for item in getattr(result, key, []):
+                uri = getattr(item, "uri", "")
+                if uri and uri not in seen:
+                    uris.append(uri)
+                    seen.add(uri)
+    return uris
 
 
 def _sanitize_floats(obj: Any) -> Any:
@@ -112,6 +157,8 @@ async def find(
         ),
     )
     result = execution.result
+    # Auto track-recall for returned URIs (fire-and-forget).
+    _track_recall_background(_ctx, _extract_uris_from_result(result))
     if hasattr(result, "to_dict"):
         result = result.to_dict()
     result = _sanitize_floats(result)
@@ -152,6 +199,8 @@ async def search(
         fn=_search,
     )
     result = execution.result
+    # Auto track-recall for returned URIs (fire-and-forget).
+    _track_recall_background(_ctx, _extract_uris_from_result(result))
     if hasattr(result, "to_dict"):
         result = result.to_dict()
     result = _sanitize_floats(result)

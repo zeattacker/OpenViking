@@ -779,7 +779,6 @@ class VikingVectorIndexBackend:
         ctx: RequestContext,
     ) -> List[Dict[str, Any]]:
         conds: List[FilterExpr] = [
-            Eq("context_type", "memory"),
             Eq("level", 2),
             Eq("account_id", ctx.account_id),
         ]

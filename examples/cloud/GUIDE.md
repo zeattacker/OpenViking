@@ -354,8 +354,6 @@ openviking:
     auto_generate_l1: true
     default_search_mode: thinking
     default_search_limit: 3
-    enable_memory_decay: true
-    memory_decay_check_interval: 3600
 ```
 
 然后安装：

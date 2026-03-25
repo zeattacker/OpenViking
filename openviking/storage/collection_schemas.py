@@ -357,6 +357,28 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         agent_id="default",
                     )
                     ctx = RequestContext(user=user, role=Role.ROOT)
+
+                    # Preserve lifecycle fields (updated_at, active_count,
+                    # created_at) from the existing vector record so that
+                    # re-vectorization does not reset the decay clock.
+                    record_id_val = inserted_data.get("id")
+                    if record_id_val:
+                        try:
+                            existing = await self._vikingdb.get([record_id_val], ctx=ctx)
+                            if existing:
+                                old = existing[0]
+                                if old.get("created_at") and not inserted_data.get("created_at"):
+                                    inserted_data["created_at"] = old["created_at"]
+                                if old.get("updated_at"):
+                                    inserted_data["updated_at"] = old["updated_at"]
+                                if int(old.get("active_count", 0) or 0) > 0:
+                                    inserted_data["active_count"] = int(old["active_count"])
+                        except Exception as lifecycle_err:
+                            logger.debug(
+                                "Could not fetch existing lifecycle fields for %s: %s",
+                                record_id_val, lifecycle_err,
+                            )
+
                     record_id = await self._vikingdb.upsert(inserted_data, ctx=ctx)
                     if record_id:
                         logger.debug(
