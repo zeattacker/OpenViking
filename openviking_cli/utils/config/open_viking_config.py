@@ -20,6 +20,7 @@ from .consts import (
 from .embedding_config import EmbeddingConfig
 from .encryption_config import EncryptionConfig
 from .log_config import LogConfig
+from .memory_config import MemoryConfig
 from .parser_config import (
     AudioConfig,
     CodeConfig,
@@ -240,6 +241,22 @@ class OpenVikingConfig(BaseModel):
                 config_class = getattr(instance, parser_type).__class__
                 setattr(instance, parser_type, config_class.from_dict(parser_data))
 
+        # Check dimension consistency
+        if (
+            getattr(instance, "storage", None)
+            and getattr(instance.storage, "vectordb", None)
+            and getattr(instance, "embedding", None)
+        ):
+            db_dim = instance.storage.vectordb.dimension
+            emb_dim = instance.embedding.dimension
+            if db_dim > 0 and emb_dim > 0 and db_dim != emb_dim:
+                import logging
+
+                logging.warning(
+                    f"Dimension mismatch: VectorDB dimension is {db_dim}, "
+                    f"but Embedding dimension is {emb_dim}. "
+                    "This may cause errors during vector search."
+                )
         return instance
 
     def to_dict(self) -> Dict[str, Any]:
