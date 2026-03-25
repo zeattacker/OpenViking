@@ -6,11 +6,12 @@ from pathlib import Path
 from threading import Lock
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 
 from openviking_cli.session.user_id import UserIdentifier
 
 from .config_loader import resolve_config_path
+from .config_utils import format_validation_error, raise_unknown_config_fields
 from .consts import (
     DEFAULT_CONFIG_DIR,
     DEFAULT_OV_CONF,
@@ -20,10 +21,12 @@ from .consts import (
 from .embedding_config import EmbeddingConfig
 from .encryption_config import EncryptionConfig
 from .log_config import LogConfig
+from .memory_config import MemoryConfig
 from .parser_config import (
     AudioConfig,
     CodeConfig,
     DirectoryConfig,
+    FeishuConfig,
     HTMLConfig,
     ImageConfig,
     MarkdownConfig,
@@ -145,6 +148,11 @@ class OpenVikingConfig(BaseModel):
         default_factory=lambda: DirectoryConfig(), description="Directory parsing configuration"
     )
 
+    feishu: FeishuConfig = Field(
+        default_factory=lambda: FeishuConfig(),
+        description="Feishu/Lark document parsing configuration",
+    )
+
     semantic: SemanticConfig = Field(
         default_factory=lambda: SemanticConfig(),
         description="Semantic processing configuration (overview/abstract limits)",
@@ -179,78 +187,112 @@ class OpenVikingConfig(BaseModel):
 
     log: LogConfig = Field(default_factory=lambda: LogConfig(), description="Logging configuration")
 
+    memory: MemoryConfig = Field(
+        default_factory=lambda: MemoryConfig(), description="Memory configuration"
+    )
+
     model_config = {"arbitrary_types_allowed": True, "extra": "forbid"}
 
     @classmethod
     def from_dict(cls, config: Dict[str, Any]) -> "OpenVikingConfig":
         """Create configuration from dictionary."""
-        # Make a copy to avoid modifying the original
-        config_copy = config.copy()
+        try:
+            # Make a copy to avoid modifying the original
+            config_copy = config.copy()
 
-        # Remove sections managed by other loaders (e.g. server config)
-        config_copy.pop("server", None)
-        config_copy.pop("bot", None)
+            parser_types = [
+                "pdf",
+                "code",
+                "image",
+                "audio",
+                "video",
+                "markdown",
+                "html",
+                "text",
+                "directory",
+                "feishu",
+            ]
+            raise_unknown_config_fields(
+                data=config_copy,
+                valid_fields=set(cls.model_fields.keys()) | {"server", "bot", "parsers"},
+                context_name="OpenVikingConfig",
+            )
 
-        # Handle parser configurations from nested "parsers" section
-        parser_configs = {}
-        if "parsers" in config_copy:
-            parser_configs = config_copy.pop("parsers")
-        parser_types = [
-            "pdf",
-            "code",
-            "image",
-            "audio",
-            "video",
-            "markdown",
-            "html",
-            "text",
-            "directory",
-        ]
-        for parser_type in parser_types:
-            if parser_type in config_copy:
-                parser_configs[parser_type] = config_copy.pop(parser_type)
-        # Handle log configuration from nested "log" section
-        log_config_data = None
-        if "log" in config_copy:
-            log_config_data = config_copy.pop("log")
+            # Remove sections managed by other loaders (e.g. server config)
+            config_copy.pop("server", None)
+            config_copy.pop("bot", None)
 
-        # Handle distillation configuration
-        distillation_config_data = None
-        if "distillation" in config_copy:
-            distillation_config_data = config_copy.pop("distillation")
+            # Handle parser configurations from nested "parsers" section
+            parser_configs = {}
+            if "parsers" in config_copy:
+                parser_configs = config_copy.pop("parsers")
+                if parser_configs is None:
+                    parser_configs = {}
+                if not isinstance(parser_configs, dict):
+                    raise ValueError("Invalid parsers config: 'parsers' section must be an object")
+            raise_unknown_config_fields(
+                data=parser_configs,
+                valid_fields=set(parser_types),
+                context_name="parsers",
+            )
+            for parser_type in parser_types:
+                if parser_type in config_copy:
+                    parser_configs[parser_type] = config_copy.pop(parser_type)
 
-        instance = cls(**config_copy)
-        # Apply log configuration
-        if log_config_data is not None:
-            instance.log = LogConfig.from_dict(log_config_data)
+            # Handle log configuration from nested "log" section
+            log_config_data = None
+            if "log" in config_copy:
+                log_config_data = config_copy.pop("log")
 
-        # Apply distillation configuration
-        if distillation_config_data is not None:
-            instance.distillation = DistillationConfig(**distillation_config_data)
+            # Handle memory configuration from nested "memory" section
+            memory_config_data = None
+            if "memory" in config_copy:
+                memory_config_data = config_copy.pop("memory")
 
-        # Apply parser configurations
-        for parser_type, parser_data in parser_configs.items():
-            if hasattr(instance, parser_type):
-                config_class = getattr(instance, parser_type).__class__
-                setattr(instance, parser_type, config_class.from_dict(parser_data))
+            # Handle distillation configuration
+            distillation_config_data = None
+            if "distillation" in config_copy:
+                distillation_config_data = config_copy.pop("distillation")
 
-        # Check dimension consistency
-        if (
-            getattr(instance, "storage", None)
-            and getattr(instance.storage, "vectordb", None)
-            and getattr(instance, "embedding", None)
-        ):
-            db_dim = instance.storage.vectordb.dimension
-            emb_dim = instance.embedding.dimension
-            if db_dim > 0 and emb_dim > 0 and db_dim != emb_dim:
-                import logging
+            instance = cls(**config_copy)
 
-                logging.warning(
-                    f"Dimension mismatch: VectorDB dimension is {db_dim}, "
-                    f"but Embedding dimension is {emb_dim}. "
-                    "This may cause errors during vector search."
-                )
-        return instance
+            # Apply log configuration
+            if log_config_data is not None:
+                instance.log = LogConfig.from_dict(log_config_data)
+
+            # Apply memory configuration
+            if memory_config_data is not None:
+                instance.memory = MemoryConfig.from_dict(memory_config_data)
+
+            # Apply distillation configuration
+            if distillation_config_data is not None:
+                instance.distillation = DistillationConfig(**distillation_config_data)
+
+            # Apply parser configurations
+            for parser_type, parser_data in parser_configs.items():
+                if hasattr(instance, parser_type):
+                    config_class = getattr(instance, parser_type).__class__
+                    setattr(instance, parser_type, config_class.from_dict(parser_data))
+
+            # Check dimension consistency
+            if (
+                getattr(instance, "storage", None)
+                and getattr(instance.storage, "vectordb", None)
+                and getattr(instance, "embedding", None)
+            ):
+                db_dim = instance.storage.vectordb.dimension
+                emb_dim = instance.embedding.dimension
+                if db_dim > 0 and emb_dim > 0 and db_dim != emb_dim:
+                    import logging
+
+                    logging.warning(
+                        f"Dimension mismatch: VectorDB dimension is {db_dim}, "
+                        f"but Embedding dimension is {emb_dim}. "
+                        "This may cause errors during vector search."
+                    )
+            return instance
+        except ValidationError as e:
+            raise ValueError(format_validation_error(root_model=cls, error=e)) from e
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert configuration to dictionary."""
@@ -341,6 +383,8 @@ class OpenVikingConfigSingleton:
             return OpenVikingConfig.from_dict(config_data)
         except json.JSONDecodeError as e:
             raise ValueError(f"Config file JSON format error: {e}")
+        except ValueError:
+            raise
         except Exception as e:
             raise RuntimeError(f"Failed to load config file: {e}")
 

@@ -60,7 +60,7 @@ def _make_request(
 
 
 def _build_auth_http_test_app(
-    identity: ResolvedIdentity,
+    identity: ResolvedIdentity | None,
     auth_enabled: bool = True,
     auth_mode: str = "api_key",
     root_api_key: str | None = None,
@@ -96,7 +96,8 @@ def _build_auth_http_test_app(
         """Return a fixed identity so tests can isolate request header behavior."""
         return identity
 
-    app.dependency_overrides[resolve_identity] = _resolve_identity_override
+    if identity is not None:
+        app.dependency_overrides[resolve_identity] = _resolve_identity_override
 
     @app.get("/api/v1/fs/ls")
     async def fs_ls(ctx=Depends(get_request_context)):
@@ -708,3 +709,9 @@ def test_validate_with_key_any_host_passes():
     for host in ("0.0.0.0", "::", "192.168.1.1", "127.0.0.1"):
         config = ServerConfig(host=host, root_api_key="some-secret-key")
         validate_server_config(config)  # should not raise
+
+
+def test_validate_trusted_mode_without_key_non_localhost_passes():
+    """Trusted mode should bypass the localhost-only dev-mode restriction."""
+    config = ServerConfig(host="0.0.0.0", root_api_key=None, auth_mode="trusted")
+    validate_server_config(config)

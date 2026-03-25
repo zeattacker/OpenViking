@@ -26,6 +26,11 @@ _ROOT_IMPLICIT_TENANT_ALLOWED_PREFIXES = (
 )
 
 
+def _auth_mode(request: Request) -> str:
+    config = getattr(request.app.state, "config", None)
+    return getattr(config, "auth_mode", "api_key")
+
+
 def _root_request_requires_explicit_tenant(path: str) -> bool:
     """Return True when a ROOT request targets tenant-scoped data APIs.
 
@@ -38,11 +43,6 @@ def _root_request_requires_explicit_tenant(path: str) -> bool:
     if path.startswith(_ROOT_IMPLICIT_TENANT_ALLOWED_PREFIXES):
         return False
     return True
-
-
-def _auth_mode(request: Request) -> Optional[str]:
-    config = getattr(request.app.state, "config", None)
-    return getattr(config, "auth_mode", None)
 
 
 def _configured_root_api_key(request: Request) -> Optional[str]:
@@ -73,8 +73,9 @@ async def resolve_identity(
     """Resolve API key to identity.
 
     Strategy:
-    - If api_key_manager is None (dev mode): return ROOT with default identity
-    - Otherwise: resolve via APIKeyManager (root key first, then user key index)
+    - trusted mode: trust explicit account/user headers and return USER identity
+    - api_key mode without manager: dev mode, return implicit ROOT/default identity
+    - api_key mode with manager: resolve via APIKeyManager (root key first, then user key index)
     """
     auth_mode = _auth_mode(request)
     api_key_manager = getattr(request.app.state, "api_key_manager", None)
@@ -123,9 +124,11 @@ async def get_request_context(
 ) -> RequestContext:
     """Convert ResolvedIdentity to RequestContext."""
     path = request.url.path
+    auth_mode = _auth_mode(request)
     api_key_manager = getattr(request.app.state, "api_key_manager", None)
     if (
-        api_key_manager is not None
+        auth_mode == "api_key"
+        and api_key_manager is not None
         and identity.role == Role.ROOT
         and _root_request_requires_explicit_tenant(path)
     ):
@@ -136,6 +139,11 @@ async def get_request_context(
                 "ROOT requests to tenant-scoped APIs must include X-OpenViking-Account "
                 "and X-OpenViking-User headers. Use a user key for regular data access."
             )
+
+    if auth_mode == "trusted" and not identity.account_id:
+        raise InvalidArgumentError("Trusted mode requests must include X-OpenViking-Account.")
+    if auth_mode == "trusted" and not identity.user_id:
+        raise InvalidArgumentError("Trusted mode requests must include X-OpenViking-User.")
 
     return RequestContext(
         user=UserIdentifier(
