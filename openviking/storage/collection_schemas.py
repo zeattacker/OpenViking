@@ -255,6 +255,7 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                         await self._vikingdb.enqueue_embedding_msg(embedding_msg)
                         self.report_success()
                         return None
+                    # No queue manager — cannot re-enqueue, drop with error
                     self.report_error("Circuit breaker open and no queue manager", data)
                     return None
 

@@ -211,11 +211,16 @@ class SemanticProcessor(DequeueHandlerBase):
             return True
 
     async def _reenqueue_semantic_msg(self, msg: SemanticMsg) -> None:
-        """Re-enqueue a semantic message for later processing."""
+        """Re-enqueue a semantic message for later processing.
+
+        Throttles with a sleep when the circuit breaker is open to prevent
+        re-enqueue storms (messages cycling at 5/sec during OPEN window).
+        """
         import asyncio
 
         from openviking.storage.queuefs import get_queue_manager
 
+        # Throttle to prevent re-enqueue storm during OPEN window
         wait = self._circuit_breaker.retry_after
         if wait > 0:
             await asyncio.sleep(wait)
@@ -243,7 +248,6 @@ class SemanticProcessor(DequeueHandlerBase):
 
             assert data is not None
             msg = SemanticMsg.from_dict(data)
-
             # Circuit breaker: if API is known-broken, re-enqueue and wait
             try:
                 self._circuit_breaker.check()
@@ -326,6 +330,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     self._merge_request_stats(msg.telemetry_id, error_count=1)
                 self.report_error(str(e), data)
             else:
+                # Transient or unknown — re-enqueue for retry
                 logger.warning(
                     f"Transient API error processing semantic message, re-enqueueing: {e}",
                     exc_info=True,
