@@ -40,6 +40,11 @@ def _root_request_requires_explicit_tenant(path: str) -> bool:
     return True
 
 
+def _auth_mode(request: Request) -> Optional[str]:
+    config = getattr(request.app.state, "config", None)
+    return getattr(config, "auth_mode", None)
+
+
 def _configured_root_api_key(request: Request) -> Optional[str]:
     config = getattr(request.app.state, "config", None)
     return getattr(config, "root_api_key", None)
@@ -71,6 +76,7 @@ async def resolve_identity(
     - If api_key_manager is None (dev mode): return ROOT with default identity
     - Otherwise: resolve via APIKeyManager (root key first, then user key index)
     """
+    auth_mode = _auth_mode(request)
     api_key_manager = getattr(request.app.state, "api_key_manager", None)
     api_key = _extract_api_key(x_api_key, authorization)
 

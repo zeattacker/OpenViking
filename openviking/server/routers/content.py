@@ -165,12 +165,18 @@ async def _do_reindex(
     ctx: RequestContext,
 ) -> dict:
     """Execute reindex within a lock scope."""
+    import posixpath
+
     from openviking.storage.transaction import LockContext, get_lock_manager
 
     viking_fs = service.viking_fs
     path = viking_fs._uri_to_path(uri, ctx=ctx)
 
-    async with LockContext(get_lock_manager(), [path], lock_mode="point"):
+    # Point locks use path/<lockfile>, which only works for directories.
+    # For file URIs, lock the parent directory instead.
+    lock_path = posixpath.dirname(path) if "." in posixpath.basename(path) else path
+
+    async with LockContext(get_lock_manager(), [lock_path], lock_mode="point"):
         if regenerate:
             return await service.resources.summarize([uri], ctx=ctx)
         else:

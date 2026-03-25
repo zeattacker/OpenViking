@@ -20,7 +20,6 @@ from .consts import (
 from .embedding_config import EmbeddingConfig
 from .encryption_config import EncryptionConfig
 from .log_config import LogConfig
-from .memory_config import MemoryConfig
 from .parser_config import (
     AudioConfig,
     CodeConfig,
