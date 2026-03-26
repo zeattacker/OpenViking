@@ -1,3 +1,5 @@
+import { createHash } from "node:crypto";
+
 import type { OpenVikingClient } from "./client.js";
 import type { MemoryOpenVikingConfig } from "./config.js";
 import type { AlignmentResult } from "./alignment.js";
@@ -11,7 +13,6 @@ import {
   extractLastAssistantText,
   buildSkillUri,
 } from "./text-utils.js";
-import { createHash } from "crypto";
 import {
   trimForLog,
   toJsonLog,
@@ -81,7 +82,7 @@ type ContextEngine = {
 };
 
 export type ContextEngineWithSessionMapping = ContextEngine & {
-  /** Return the OV session ID for an OpenClaw sessionKey (identity: sessionKey IS the OV session ID). */
+  /** Return the OV session ID for an OpenClaw sessionKey using a stable cross-platform-safe mapping. */
   getOVSessionForKey: (sessionKey: string) => string;
   /** Ensure an OV session exists on the server for the given OpenClaw sessionKey (auto-created by getSession if absent). */
   resolveOVSession: (sessionKey: string) => Promise<string>;
@@ -142,6 +143,30 @@ function warnOrInfo(logger: Logger, message: string): void {
   logger.info(message);
 }
 
+function md5Short(input: string): string {
+  return createHash("md5").update(input).digest("hex").slice(0, 12);
+}
+
+const SAFE_SESSION_KEY_RE = /^[A-Za-z0-9_-]+$/;
+
+export function mapSessionKeyToOVSessionId(sessionKey: string): string {
+  const normalized = sessionKey.trim();
+  if (!normalized) {
+    return "openclaw_session";
+  }
+  if (SAFE_SESSION_KEY_RE.test(normalized)) {
+    return normalized;
+  }
+
+  const readable = normalized
+    .replace(/[^A-Za-z0-9_-]+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "")
+    .slice(0, 48);
+  const digest = md5Short(normalized);
+  return readable ? `openclaw_${readable}_${digest}` : `openclaw_session_${digest}`;
+}
+
 // Per-session capture throttle to prevent flooding OpenViking with rapid
 // extract calls. Only successful captures (or captures that reach the server
 // but extract 0 memories) trigger cooldown. Connection errors do NOT trigger
@@ -178,11 +203,12 @@ export function createMemoryOpenVikingContextEngine(params: {
     try {
       const client = await getClient();
       const agentId = resolveAgentId(sessionKey);
-      const commitResult = await client.commitSession(sessionKey, { wait: true, agentId });
+      const ovSessionId = mapSessionKeyToOVSessionId(sessionKey);
+      const commitResult = await client.commitSession(ovSessionId, { wait: true, agentId });
       logger.info(
-        `openviking: committed OV session for sessionKey=${sessionKey}, archived=${commitResult.archived ?? false}, memories=${commitResult.memories_extracted ?? 0}, task_id=${commitResult.task_id ?? "none"}`,
+        `openviking: committed OV session for sessionKey=${sessionKey}, ovSessionId=${ovSessionId}, archived=${commitResult.archived ?? false}, memories=${commitResult.memories_extracted ?? 0}, task_id=${commitResult.task_id ?? "none"}`,
       );
-      await client.deleteSession(sessionKey, agentId).catch(() => {});
+      await client.deleteSession(ovSessionId, agentId).catch(() => {});
     } catch (err) {
       warnOrInfo(logger, `openviking: commit failed for sessionKey=${sessionKey}: ${String(err)}`);
     }
@@ -215,10 +241,10 @@ export function createMemoryOpenVikingContextEngine(params: {
 
     // --- session-mapping extensions ---
 
-    getOVSessionForKey: (sessionKey: string) => sessionKey,
+    getOVSessionForKey: (sessionKey: string) => mapSessionKeyToOVSessionId(sessionKey),
 
     async resolveOVSession(sessionKey: string): Promise<string> {
-      return sessionKey;
+      return mapSessionKeyToOVSessionId(sessionKey);
     },
 
     commitOVSession: doCommitOVSession,
@@ -337,7 +363,10 @@ export function createMemoryOpenVikingContextEngine(params: {
         const { turns } = extractNewTurnMessages(messages, start);
 
         const client = await getClient();
-        const sessionId = await client.createSession();
+        const ovSessionId = sessionKey
+          ? mapSessionKeyToOVSessionId(sessionKey)
+          : afterTurnParams.sessionId;
+        const sessionId = await client.createSession(ovSessionId);
         try {
           // Ingest structured turns: send tool calls as structured ToolPart for skill extraction
           if (turns.length > 0) {
