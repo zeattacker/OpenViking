@@ -28,7 +28,7 @@ template: |
       "pages": [
           {
               "index": 0,
-              "semantic_name": "Page semantic name (for URI, English or Chinese, 2-6 words, e.g., 'viking_architecture' or 'system_architecture')",
+              "semantic_name": "Page semantic name (for URI, in the user's language or English, 2-6 words, e.g., 'viking_architecture' or 'system_architecture')",
               "abstract": "Brief page description (no more than 50 words)",
               "overview": "Detailed page content (no more than 300 words)",
               "detail_text": "Complete page text content (OCR recognition)",

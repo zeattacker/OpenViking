@@ -12,7 +12,7 @@ fields:
   - name: topic
     type: string
     description: |
-      Preference topic in Chinese or English. If English, use lowercase with underscores, max 3 words.
+      Preference topic in the user's language or English. If English, use lowercase with underscores, max 3 words.
       Preference topic used to uniquely identify this preference memory.
       Should be a semantic topic description such as "Python code style", "Communication style", "Food preference", "Commute preference", etc.
       Different preference topics should be stored as separate memories, do not mix unrelated preferences.
