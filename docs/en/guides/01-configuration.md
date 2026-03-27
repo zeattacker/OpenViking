@@ -744,6 +744,22 @@ openviking-server --config /path/to/ov.conf
 
 The config sections documented above (embedding, vlm, rerank, storage) all belong to `ov.conf`. SDK embedded mode and server share this file.
 
+For memory-related settings, add a `memory` section in `ov.conf`:
+
+```json
+{
+  "memory": {
+    "agent_scope_mode": "user+agent"
+  }
+}
+```
+
+| Field | Description | Default |
+|-------|-------------|---------|
+| `agent_scope_mode` | Agent memory namespace mode: `"user+agent"` isolates by `(user_id, agent_id)`, while `"agent"` isolates only by `agent_id` and shares agent memories across users of the same agent | `"user+agent"` |
+
+`agent_scope_mode` only affects agent-level namespaces such as `viking://agent/{agent_space}/memories/...`. User memories under `viking://user/{user_space}/memories/...` are not affected.
+
 ### ovcli.conf
 
 Config file for the HTTP client (`SyncHTTPClient` / `AsyncHTTPClient`) and CLI to connect to a remote server:

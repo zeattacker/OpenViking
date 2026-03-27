@@ -721,6 +721,22 @@ openviking-server --config /path/to/ov.conf
 
 本文档上方各配置段（embedding、vlm、rerank、storage）均属于 `ov.conf`。SDK 嵌入模式和服务端共用此文件。
 
+如需配置 memory 相关行为，可在 `ov.conf` 中添加 `memory` 段：
+
+```json
+{
+  "memory": {
+    "agent_scope_mode": "user+agent"
+  }
+}
+```
+
+| 字段 | 说明 | 默认值 |
+|------|------|--------|
+| `agent_scope_mode` | Agent memory 命名空间模式：`"user+agent"` 按 `(user_id, agent_id)` 隔离；`"agent"` 仅按 `agent_id` 隔离，同一 agent 的不同用户共享 agent memory | `"user+agent"` |
+
+`agent_scope_mode` 只影响 `viking://agent/{agent_space}/memories/...` 这类 agent 级命名空间，不影响 `viking://user/{user_space}/memories/...` 下的 user memory。
+
 ### ovcli.conf
 
 HTTP 客户端（`SyncHTTPClient` / `AsyncHTTPClient`）和 CLI 工具连接远程服务端的配置文件：
