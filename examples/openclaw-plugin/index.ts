@@ -657,14 +657,18 @@ const contextEnginePlugin = {
           try {
             await withTimeout(
               (async () => {
+                const MAX_QUERY_CHARS = 6000;
+                const searchQuery = queryText.length > MAX_QUERY_CHARS
+                  ? queryText.slice(0, MAX_QUERY_CHARS)
+                  : queryText;
                 const candidateLimit = Math.max(cfg.recallLimit * 4, 20);
                 const [userSettled, agentSettled] = await Promise.allSettled([
-                  client.find(queryText, {
+                  client.find(searchQuery, {
                     targetUri: "viking://user/memories",
                     limit: candidateLimit,
                     scoreThreshold: 0,
                   }, agentId),
-                  client.find(queryText, {
+                  client.find(searchQuery, {
                     targetUri: "viking://agent/memories",
                     limit: candidateLimit,
                     scoreThreshold: 0,
