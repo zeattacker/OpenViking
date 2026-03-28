@@ -90,6 +90,12 @@
       "advanced": true,
       "help": "Maximum estimated tokens for auto-recall memory injection"
     },
+    "commitTokenThreshold": {
+      "label": "Commit Token Threshold",
+      "placeholder": "2000",
+      "advanced": true,
+      "help": "Minimum estimated pending tokens before auto-commit triggers. Set to 0 to commit every turn."
+    },
     "ingestReplyAssist": {
       "label": "Ingest Reply Assist",
       "help": "When transcript-like memory ingestion is detected, add a lightweight reply instruction to reduce NO_REPLY.",
@@ -121,6 +127,11 @@
       "label": "Alignment Check",
       "help": "Evaluate responses against constraints. Modes: observe_only (log), soft_enforce (block hard), full_enforce (block + correct).",
       "advanced": true
+    },
+    "emitStandardDiagnostics": {
+      "label": "Standard diagnostics (diag JSON lines)",
+      "advanced": true,
+      "help": "Emit structured openviking: diag {...} for assemble/afterTurn. Set false to disable."
     }
   },
   "configSchema": {
@@ -178,6 +189,9 @@
       "recallTokenBudget": {
         "type": "number"
       },
+      "commitTokenThreshold": {
+        "type": "number"
+      },
       "ingestReplyAssist": {
         "type": "boolean"
       },
@@ -204,6 +218,9 @@
           "driftConsecutiveFlagLimit": { "type": "number" }
         },
         "additionalProperties": false
+      },
+      "emitStandardDiagnostics": {
+        "type": "boolean"
       }
     }
   }

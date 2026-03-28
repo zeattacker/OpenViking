@@ -3,9 +3,11 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use std::fs::File;
 use std::path::Path;
-use tempfile::NamedTempFile;
+use tempfile::{Builder, NamedTempFile};
+use url::Url;
 use zip::write::FileOptions;
 use zip::CompressionMethod;
+use zip::write::FileOptions;
 
 use crate::error::{Error, Result};
 
