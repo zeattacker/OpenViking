@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
-
-import type { OpenVikingClient } from "./client.js";
+import type { OpenVikingClient, OVMessage } from "./client.js";
 import type { MemoryOpenVikingConfig } from "./config.js";
 import type { AlignmentResult } from "./alignment.js";
 import { alignmentCheck, assembleProfile } from "./alignment.js";
@@ -67,8 +66,15 @@ type ContextEngine = {
     isHeartbeat?: boolean;
     tokenBudget?: number;
     runtimeContext?: Record<string, unknown>;
+    sessionKey?: string;
   }) => Promise<void>;
-  assemble: (params: { sessionId: string; messages: AgentMessage[]; tokenBudget?: number }) => Promise<AssembleResult>;
+  assemble: (params: {
+    sessionId: string;
+    sessionKey?: string;
+    messages: AgentMessage[];
+    tokenBudget?: number;
+    runtimeContext?: Record<string, unknown>;
+  }) => Promise<AssembleResult>;
   compact: (params: {
     sessionId: string;
     sessionFile: string;
@@ -115,12 +121,208 @@ async function tryLegacyCompact(params: {
     "openclaw/dist/context-engine/legacy.js",
   ];
 
-  for (const path of candidates) {
-    try {
-      const mod = (await import(path)) as {
-        LegacyContextEngine?: new () => {
-          compact: (arg: typeof params) => Promise<CompactResult>;
-        };
+function msgTokenEstimate(msg: AgentMessage): number {
+  const raw = (msg as Record<string, unknown>).content;
+  if (typeof raw === "string") return Math.ceil(raw.length / 4);
+  if (Array.isArray(raw)) return Math.ceil(JSON.stringify(raw).length / 4);
+  return 1;
+}
+
+function messageDigest(messages: AgentMessage[], maxCharsPerMsg = 2000): Array<{role: string; content: string; tokens: number; truncated: boolean}> {
+  return messages.map((msg) => {
+    const m = msg as Record<string, unknown>;
+    const role = String(m.role ?? "unknown");
+    const raw = m.content;
+    let text: string;
+    if (typeof raw === "string") {
+      text = raw;
+    } else if (Array.isArray(raw)) {
+      text = (raw as Record<string, unknown>[])
+        .map((b) => {
+          if (b.type === "text") return String(b.text ?? "");
+          if (b.type === "toolUse") return `[toolUse: ${String(b.name)}(${JSON.stringify(b.arguments ?? {}).slice(0, 200)})]`;
+          if (b.type === "toolResult") return `[toolResult: ${JSON.stringify(b.content ?? "").slice(0, 200)}]`;
+          return `[${String(b.type)}]`;
+        })
+        .join("\n");
+    } else {
+      text = JSON.stringify(raw) ?? "";
+    }
+    const truncated = text.length > maxCharsPerMsg;
+    return {
+      role,
+      content: truncated ? text.slice(0, maxCharsPerMsg) + "..." : text,
+      tokens: msgTokenEstimate(msg),
+      truncated,
+    };
+  });
+}
+
+function emitDiag(log: typeof logger, stage: string, sessionId: string, data: Record<string, unknown>, enabled = true): void {
+  if (!enabled) return;
+  log.info(`openviking: diag ${JSON.stringify({ ts: Date.now(), stage, sessionId, data })}`);
+}
+
+function totalExtractedMemories(memories?: Record<string, number>): number {
+  if (!memories || typeof memories !== "object") {
+    return 0;
+  }
+  return Object.values(memories).reduce((sum, count) => sum + (count ?? 0), 0);
+}
+
+function validTokenBudget(raw: unknown): number | undefined {
+  if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+    return raw;
+  }
+  return undefined;
+}
+
+/** OpenClaw session UUID (path-safe on Windows). */
+const OPENVIKING_OV_SESSION_UUID =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+const WINDOWS_BAD_SESSION_SEGMENT = /[:<>"\\/|?\u0000-\u001f]/;
+
+/**
+ * Map OpenClaw session identity to an OpenViking session_id that is safe as a single
+ * AGFS path segment on Windows (no `:` etc.). Prefer UUID sessionId when present;
+ * otherwise derive a stable sha256 from sessionKey.
+ */
+export function openClawSessionToOvStorageId(
+  sessionId: string | undefined,
+  sessionKey: string | undefined,
+): string {
+  const sid = typeof sessionId === "string" ? sessionId.trim() : "";
+  const key = typeof sessionKey === "string" ? sessionKey.trim() : "";
+
+  if (sid && OPENVIKING_OV_SESSION_UUID.test(sid)) {
+    return sid.toLowerCase();
+  }
+  if (key) {
+    return createHash("sha256").update(key, "utf8").digest("hex");
+  }
+  if (sid) {
+    if (WINDOWS_BAD_SESSION_SEGMENT.test(sid)) {
+      return createHash("sha256").update(`openclaw-session:${sid}`, "utf8").digest("hex");
+    }
+    return sid;
+  }
+  throw new Error("openviking: need sessionId or sessionKey for OV session path");
+}
+
+/** Normalize a hook/tool session ref (uuid, sessionKey, or already-safe id) for OV storage. */
+export function openClawSessionRefToOvStorageId(ref: string): string {
+  const t = ref.trim();
+  if (!t) {
+    throw new Error("openviking: empty session ref");
+  }
+  if (OPENVIKING_OV_SESSION_UUID.test(t)) {
+    return t.toLowerCase();
+  }
+  if (WINDOWS_BAD_SESSION_SEGMENT.test(t)) {
+    return createHash("sha256").update(t, "utf8").digest("hex");
+  }
+  return t;
+}
+
+/**
+ * Convert an OpenViking stored message (parts-based format) into one or more
+ * OpenClaw AgentMessages (content-blocks format).
+ *
+ * For assistant messages with ToolParts, this produces:
+ * 1. The assistant message with toolUse blocks in its content array
+ * 2. A separate toolResult message per ToolPart (carrying tool_output)
+ */
+function convertToAgentMessages(msg: { role: string; parts: unknown[] }): AgentMessage[] {
+  const parts = msg.parts ?? [];
+  const contentBlocks: Record<string, unknown>[] = [];
+  const toolResults: AgentMessage[] = [];
+
+  for (const part of parts) {
+    if (!part || typeof part !== "object") continue;
+    const p = part as Record<string, unknown>;
+
+    if (p.type === "text" && typeof p.text === "string") {
+      contentBlocks.push({ type: "text", text: p.text });
+    } else if (p.type === "context") {
+      if (typeof p.abstract === "string" && p.abstract) {
+        contentBlocks.push({ type: "text", text: p.abstract });
+      }
+    } else if (p.type === "tool" && msg.role === "assistant") {
+      const toolId = typeof p.tool_id === "string" ? p.tool_id : "";
+      const toolName = typeof p.tool_name === "string" ? p.tool_name : "unknown";
+
+      if (toolId) {
+        contentBlocks.push({
+          type: "toolUse",
+          id: toolId,
+          name: toolName,
+          input: p.tool_input ?? {},
+        });
+
+        const status = typeof p.tool_status === "string" ? p.tool_status : "";
+        const output = typeof p.tool_output === "string" ? p.tool_output : "";
+
+        if (status === "completed" || status === "error") {
+          toolResults.push({
+            role: "toolResult",
+            toolCallId: toolId,
+            toolName,
+            content: [{ type: "text", text: output || "(no output)" }],
+            isError: status === "error",
+          } as unknown as AgentMessage);
+        } else {
+          toolResults.push({
+            role: "toolResult",
+            toolCallId: toolId,
+            toolName,
+            content: [{ type: "text", text: "(interrupted — tool did not complete)" }],
+            isError: false,
+          } as unknown as AgentMessage);
+        }
+      } else {
+        // No tool_id: degrade to text block to preserve information.
+        // Cannot emit toolUse/toolResult without a valid id.
+        const status = typeof p.tool_status === "string" ? p.tool_status : "unknown";
+        const output = typeof p.tool_output === "string" ? p.tool_output : "";
+        const segments = [`[${toolName}] (${status})`];
+        if (p.tool_input) {
+          try {
+            segments.push(`Input: ${JSON.stringify(p.tool_input)}`);
+          } catch {
+            // non-serializable input, skip
+          }
+        }
+        if (output) {
+          segments.push(`Output: ${output}`);
+        }
+        contentBlocks.push({ type: "text", text: segments.join("\n") });
+      }
+    }
+  }
+
+  const result: AgentMessage[] = [];
+
+  if (msg.role === "assistant") {
+    result.push({ role: msg.role, content: contentBlocks });
+    result.push(...toolResults);
+  } else {
+    const texts = contentBlocks
+      .filter((b) => b.type === "text")
+      .map((b) => b.text as string);
+    result.push({ role: msg.role, content: texts.join("\n") || "" });
+  }
+
+  return result;
+}
+
+function normalizeAssistantContent(messages: AgentMessage[]): void {
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i];
+    if (msg?.role === "assistant" && typeof msg.content === "string") {
+      messages[i] = {
+        ...msg,
+        content: [{ type: "text", text: msg.content }],
       };
       if (!mod?.LegacyContextEngine) {
         continue;
@@ -143,8 +345,58 @@ function warnOrInfo(logger: Logger, message: string): void {
   logger.info(message);
 }
 
-function md5Short(input: string): string {
-  return createHash("md5").update(input).digest("hex").slice(0, 12);
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+const PHASE2_POLL_INTERVAL_MS = 800;
+const PHASE2_POLL_MAX_MS = 120_000;
+
+/**
+ * After wait=false commit, Phase2 runs on the server. Poll task until completed/failed/timeout
+ * so logs show memories_extracted (otherwise it looks like "nothing was saved").
+ */
+async function pollPhase2ExtractionOutcome(
+  getClient: () => Promise<OpenVikingClient>,
+  taskId: string,
+  agentId: string,
+  logger: Logger,
+  sessionLabel: string,
+): Promise<void> {
+  const deadline = Date.now() + PHASE2_POLL_MAX_MS;
+  try {
+    const client = await getClient();
+    while (Date.now() < deadline) {
+      await sleep(PHASE2_POLL_INTERVAL_MS);
+      const task = await client.getTask(taskId, agentId).catch((e) => {
+        logger.warn(`openviking: phase2 getTask failed task_id=${taskId}: ${String(e)}`);
+        return null;
+      });
+      if (!task) {
+        return;
+      }
+      const { status } = task;
+      if (status === "completed") {
+        logger.info(
+          `openviking: phase2 completed task_id=${taskId} session=${sessionLabel} ` +
+            `result=${toJsonLog(task.result ?? {})}`,
+        );
+        return;
+      }
+      if (status === "failed") {
+        logger.warn(
+          `openviking: phase2 failed task_id=${taskId} session=${sessionLabel} error=${task.error ?? "unknown"}`,
+        );
+        return;
+      }
+    }
+    logger.warn(
+      `openviking: phase2 poll timeout (${PHASE2_POLL_MAX_MS / 1000}s) task_id=${taskId} session=${sessionLabel} — ` +
+        `check GET /api/v1/tasks/${taskId}`,
+    );
+  } catch (e) {
+    logger.warn(`openviking: phase2 poll exception task_id=${taskId}: ${String(e)}`);
+  }
 }
 
 const SAFE_SESSION_KEY_RE = /^[A-Za-z0-9_-]+$/;
@@ -186,9 +438,15 @@ export function createMemoryOpenVikingContextEngine(params: {
   cfg: Required<MemoryOpenVikingConfig>;
   logger: Logger;
   getClient: () => Promise<OpenVikingClient>;
-  resolveAgentId: (sessionId: string) => string;
-  pendingAlignmentFlags?: Map<string, AlignmentResult>;
-}): ContextEngineWithSessionMapping {
+  /** Extra args help match hook-populated routing when OpenClaw provides sessionKey / OV session id. */
+  resolveAgentId: (sessionId: string, sessionKey?: string, ovSessionId?: string) => string;
+  rememberSessionAgentId?: (ctx: {
+    agentId?: string;
+    sessionId?: string;
+    sessionKey?: string;
+    ovSessionId?: string;
+  }) => void;
+}): ContextEngineWithCommit {
   const {
     id,
     name,
@@ -197,16 +455,31 @@ export function createMemoryOpenVikingContextEngine(params: {
     logger,
     getClient,
     resolveAgentId,
+    rememberSessionAgentId,
   } = params;
 
   async function doCommitOVSession(sessionKey: string): Promise<void> {
     try {
       const client = await getClient();
-      const agentId = resolveAgentId(sessionKey);
-      const ovSessionId = mapSessionKeyToOVSessionId(sessionKey);
-      const commitResult = await client.commitSession(ovSessionId, { wait: true, agentId });
+      const ovId = openClawSessionRefToOvStorageId(sessionId);
+      rememberSessionAgentId?.({
+        sessionId,
+        sessionKey: sessionId,
+        ovSessionId: ovId,
+      });
+      const agentId = resolveAgentId(sessionId, sessionId, ovId);
+      const commitResult = await client.commitSession(ovId, { wait: true, agentId });
+      const memCount = totalExtractedMemories(commitResult.memories_extracted);
+      if (commitResult.status === "failed") {
+        warnOrInfo(logger, `openviking: commit Phase 2 failed for session=${sessionId}: ${commitResult.error ?? "unknown"}`);
+        return false;
+      }
+      if (commitResult.status === "timeout") {
+        warnOrInfo(logger, `openviking: commit Phase 2 timed out for session=${sessionId}, task_id=${commitResult.task_id ?? "none"}`);
+        return false;
+      }
       logger.info(
-        `openviking: committed OV session for sessionKey=${sessionKey}, ovSessionId=${ovSessionId}, archived=${commitResult.archived ?? false}, memories=${commitResult.memories_extracted ?? 0}, task_id=${commitResult.task_id ?? "none"}`,
+        `openviking: committed OV session=${sessionId} ovId=${ovId}, archived=${commitResult.archived ?? false}, memories=${memCount}, task_id=${commitResult.task_id ?? "none"}`,
       );
       await client.deleteSession(ovSessionId, agentId).catch(() => {});
     } catch (err) {
@@ -222,15 +495,26 @@ export function createMemoryOpenVikingContextEngine(params: {
     return typeof key === "string" && key.trim() ? key.trim() : undefined;
   }
 
-  const driftDetector = cfg.alignment?.enabled
-    ? new DriftDetector({
-        windowSize: cfg.alignment.driftWindowSize,
-        alertThreshold: cfg.alignment.driftAlertThreshold,
-        consecutiveFlagLimit: cfg.alignment.driftConsecutiveFlagLimit,
-        dataDir: DEFAULT_MEMORY_OPENVIKING_DATA_DIR,
-        logger,
-      })
-    : null;
+  function extractAssembleSessionKey(params: {
+    sessionKey?: string;
+    runtimeContext?: Record<string, unknown>;
+  }): string | undefined {
+    const direct = typeof params.sessionKey === "string" ? params.sessionKey.trim() : "";
+    if (direct) {
+      return direct;
+    }
+    return extractSessionKey(params.runtimeContext);
+  }
+
+  function extractRuntimeAgentId(
+    runtimeContext: Record<string, unknown> | undefined,
+  ): string | undefined {
+    if (!runtimeContext) {
+      return undefined;
+    }
+    const agentId = runtimeContext.agentId;
+    return typeof agentId === "string" && agentId.trim() ? agentId.trim() : undefined;
+  }
 
   return {
     info: {
@@ -260,10 +544,139 @@ export function createMemoryOpenVikingContextEngine(params: {
     },
 
     async assemble(assembleParams): Promise<AssembleResult> {
-      return {
-        messages: assembleParams.messages,
-        estimatedTokens: estimateTokens(assembleParams.messages),
-      };
+      const { messages } = assembleParams;
+      const tokenBudget = validTokenBudget(assembleParams.tokenBudget) ?? 128_000;
+      const sessionKey = extractAssembleSessionKey(assembleParams);
+
+      const originalTokens = roughEstimate(messages);
+
+      const OVSessionId = openClawSessionToOvStorageId(assembleParams.sessionId, sessionKey);
+      rememberSessionAgentId?.({
+        sessionId: assembleParams.sessionId,
+        sessionKey,
+        agentId: extractRuntimeAgentId(assembleParams.runtimeContext),
+        ovSessionId: OVSessionId,
+      });
+      diag("assemble_entry", OVSessionId, {
+        messagesCount: messages.length,
+        inputTokenEstimate: originalTokens,
+        tokenBudget,
+        sessionKey: sessionKey ?? null,
+        messages: messageDigest(messages),
+      });
+
+      try {
+        const client = await getClient();
+        const routingRef =
+          assembleParams.sessionId ?? sessionKey ?? OVSessionId;
+        const agentId = resolveAgentId(routingRef, sessionKey, OVSessionId);
+        const ctx = await client.getSessionContext(
+          OVSessionId,
+          tokenBudget,
+          agentId,
+        );
+
+        const hasArchives = !!ctx?.latest_archive_id;
+        const activeCount = ctx?.messages?.length ?? 0;
+        const preAbstracts = ctx?.pre_archive_abstracts ?? [];
+
+        if (!ctx || (!hasArchives && activeCount === 0)) {
+          diag("assemble_result", OVSessionId, {
+            passthrough: true, reason: "no_ov_data",
+            archiveCount: 0, activeCount: 0,
+            outputMessagesCount: messages.length,
+            inputTokenEstimate: originalTokens,
+            estimatedTokens: originalTokens,
+            tokensSaved: 0, savingPct: 0,
+          });
+          return { messages, estimatedTokens: roughEstimate(messages) };
+        }
+
+        if (!hasArchives && ctx.messages.length < messages.length) {
+          diag("assemble_result", OVSessionId, {
+            passthrough: true, reason: "ov_msgs_fewer_than_input",
+            archiveCount: 0, activeCount,
+            outputMessagesCount: messages.length,
+            inputTokenEstimate: originalTokens,
+            estimatedTokens: originalTokens,
+            tokensSaved: 0, savingPct: 0,
+          });
+          return { messages, estimatedTokens: roughEstimate(messages) };
+        }
+
+        const assembled: AgentMessage[] = [];
+
+        if (ctx.latest_archive_overview) {
+          assembled.push({
+            role: "user" as const,
+            content: `[Session History Summary]\n${ctx.latest_archive_overview}`,
+          });
+        }
+
+        if (preAbstracts.length > 0 || ctx.latest_archive_id) {
+          const lines: string[] = preAbstracts.map(
+            (a) => `${a.archive_id}: ${a.abstract}`,
+          );
+          if (ctx.latest_archive_id) {
+            lines.push(
+              `(latest: ${ctx.latest_archive_id} — see [Session History Summary] above)`,
+            );
+          }
+          assembled.push({
+            role: "user" as const,
+            content: `[Archive Index]\n${lines.join("\n")}`,
+          });
+        }
+
+        assembled.push(...ctx.messages.flatMap((m) => convertToAgentMessages(m)));
+
+        normalizeAssistantContent(assembled);
+        const sanitized = sanitizeToolUseResultPairing(assembled as never[]) as AgentMessage[];
+
+        if (sanitized.length === 0 && messages.length > 0) {
+          diag("assemble_result", OVSessionId, {
+            passthrough: true, reason: "sanitized_empty",
+            archiveCount: preAbstracts.length + (ctx.latest_archive_id ? 1 : 0),
+            activeCount,
+            outputMessagesCount: messages.length,
+            inputTokenEstimate: originalTokens,
+            estimatedTokens: originalTokens,
+            tokensSaved: 0, savingPct: 0,
+          });
+          return { messages, estimatedTokens: roughEstimate(messages) };
+        }
+
+        const assembledTokens = roughEstimate(sanitized);
+        const archiveCount = preAbstracts.length + (ctx.latest_archive_id ? 1 : 0);
+        const tokensSaved = originalTokens - assembledTokens;
+        const savingPct = originalTokens > 0 ? Math.round((tokensSaved / originalTokens) * 100) : 0;
+
+        diag("assemble_result", OVSessionId, {
+          passthrough: false,
+          archiveCount,
+          activeCount,
+          outputMessagesCount: sanitized.length,
+          inputTokenEstimate: originalTokens,
+          estimatedTokens: assembledTokens,
+          tokensSaved,
+          savingPct,
+          latestArchiveId: ctx.latest_archive_id ?? null,
+          messages: messageDigest(sanitized),
+        });
+
+        return {
+          messages: sanitized,
+          estimatedTokens: ctx.estimatedTokens,
+          ...(hasArchives
+            ? { systemPromptAddition: buildSystemPromptAddition() }
+            : {}),
+        };
+      } catch (err) {
+        diag("assemble_error", OVSessionId, {
+          error: String(err),
+        });
+        return { messages, estimatedTokens: roughEstimate(messages) };
+      }
     },
 
     async afterTurn(afterTurnParams): Promise<void> {
@@ -271,16 +684,26 @@ export function createMemoryOpenVikingContextEngine(params: {
         return;
       }
 
-      // Per-session cooldown: skip if this session captured recently
-      const now = Date.now();
-      const sessionKey = afterTurnParams.sessionId ?? "__global__";
-      const lastCapture = _sessionLastCapture.get(sessionKey) ?? 0;
-      if (now - lastCapture < CAPTURE_COOLDOWN_MS) {
-        logger.info(
-          `openviking: auto-capture skipped (cooldown, ${Math.round((CAPTURE_COOLDOWN_MS - (now - lastCapture)) / 1000)}s remaining)`,
+      try {
+        const sessionKey =
+          (typeof afterTurnParams.sessionKey === "string" && afterTurnParams.sessionKey.trim()) ||
+          extractSessionKey(afterTurnParams.runtimeContext);
+        const OVSessionId = openClawSessionToOvStorageId(
+          afterTurnParams.sessionId,
+          sessionKey,
         );
-        return;
-      }
+        const runtimeAgentId = extractRuntimeAgentId(afterTurnParams.runtimeContext);
+        if (runtimeAgentId) {
+          rememberSessionAgentId?.({
+            agentId: runtimeAgentId,
+            sessionId: afterTurnParams.sessionId,
+            sessionKey,
+            ovSessionId: OVSessionId,
+          });
+        }
+        const routingRef =
+          afterTurnParams.sessionId ?? sessionKey ?? OVSessionId;
+        const agentId = resolveAgentId(routingRef, sessionKey, OVSessionId);
 
       // Exponential backoff after consecutive failures
       if (_consecutiveCaptureFailures >= MAX_CONSECUTIVE_FAILURES) {
@@ -328,7 +751,10 @@ export function createMemoryOpenVikingContextEngine(params: {
           logger.info(`openviking: instructions sync skipped: ${String(err)}`);
         }
         if (messages.length === 0) {
-          logger.info("openviking: auto-capture skipped (messages=0)");
+          diag("afterTurn_skip", OVSessionId, {
+            reason: "no_messages",
+            totalMessages: 0,
+          });
           return;
         }
 
@@ -341,7 +767,11 @@ export function createMemoryOpenVikingContextEngine(params: {
         const { texts: newTexts, newCount } = extractNewTurnTexts(messages, start);
 
         if (newTexts.length === 0) {
-          logger.info("openviking: auto-capture skipped (no new user/assistant messages)");
+          diag("afterTurn_skip", OVSessionId, {
+            reason: "no_new_turn_messages",
+            totalMessages: messages.length,
+            prePromptMessageCount: start,
+          });
           return;
         }
 
@@ -403,82 +833,65 @@ export function createMemoryOpenVikingContextEngine(params: {
           await client.getSession(sessionId, agentId).catch(() => ({}));
           const commitResult = await client.commitSession(sessionId, { wait: true, agentId });
 
-          logger.info(
-            `openviking: committed ${newCount} messages in session=${sessionId}, ` +
-              `archived=${commitResult.archived ?? false}, memories=${commitResult.memories_extracted ?? 0}, ` +
-              `task_id=${commitResult.task_id ?? "none"} ${toJsonLog({ captured: [trimForLog(turnText, 260)] })}`,
-          );
-          // Capture reached the server — set cooldown and reset failures
-          _sessionLastCapture.set(sessionKey, Date.now());
-          _consecutiveCaptureFailures = 0;
+        if (sanitized) {
+          await client.addSessionMessage(OVSessionId, "user", sanitized, agentId);
+        } else {
+          diag("afterTurn_skip", OVSessionId, {
+            reason: "sanitized_empty",
+          });
+          return;
+        }
 
-          // Prune old session entries to prevent memory leak
-          if (_sessionLastCapture.size > 200) {
-            const cutoff = Date.now() - CAPTURE_COOLDOWN_MS * 10;
-            for (const [k, t] of _sessionLastCapture) {
-              if (t < cutoff) _sessionLastCapture.delete(k);
-            }
+        const session = await client.getSession(OVSessionId, agentId);
+        const pendingTokens = session.pending_tokens ?? 0;
+
+        if (pendingTokens < cfg.commitTokenThreshold) {
+          diag("afterTurn_skip", OVSessionId, {
+            reason: "below_threshold",
+            pendingTokens,
+            commitTokenThreshold: cfg.commitTokenThreshold,
+          });
+          return;
+        }
+
+        const commitResult = await client.commitSession(OVSessionId, { wait: false, agentId });
+        const commitExtra = cfg.logFindRequests
+          ? ` ${toJsonLog({ captured: [trimForLog(turnText, 260)] })}`
+          : "";
+        logger.info(
+          `openviking: committed session=${OVSessionId}, ` +
+            `status=${commitResult.status}, archived=${commitResult.archived ?? false}, ` +
+            `task_id=${commitResult.task_id ?? "none"}${commitExtra}`,
+        );
+
+        diag("afterTurn_commit", OVSessionId, {
+          pendingTokens,
+          commitTokenThreshold: cfg.commitTokenThreshold,
+          status: commitResult.status,
+          archived: commitResult.archived ?? false,
+          taskId: commitResult.task_id ?? null,
+          extractedMemories: (commitResult as any).extracted_memories ?? null,
+        });
+        if (commitResult.task_id && cfg.logFindRequests) {
+          logger.info(
+            `openviking: Phase2 memory extraction runs asynchronously on the server (task_id=${commitResult.task_id}). ` +
+              "memories_extracted appears only after that task completes — not in this immediate response.",
+          );
+          if (cfg.logFindRequests) {
+            void pollPhase2ExtractionOutcome(
+              getClient,
+              commitResult.task_id,
+              agentId,
+              logger,
+              OVSessionId,
+            );
           }
-        } finally {
-          await client.deleteSession(sessionId).catch(() => {});
         }
       } catch (err) {
-        // Connection/server errors: do NOT set cooldown so next turn retries
-        _consecutiveCaptureFailures++;
-        warnOrInfo(
-          logger,
-          `openviking: auto-capture failed (${_consecutiveCaptureFailures}/${MAX_CONSECUTIVE_FAILURES}): ${String(err)}`,
-        );
-      }
-
-      // P2: Alignment evaluation (post-delivery)
-      if (cfg.alignment?.enabled && driftDetector) {
-        try {
-          const assistantText = extractLastAssistantText(afterTurnParams.messages ?? []);
-          if (assistantText && assistantText.length > 20) {
-            const client = await getClient();
-            let instructionsText = "";
-            try {
-              instructionsText = await client.read("viking://agent/instructions/");
-            } catch {
-              // No instructions — only default constraints active
-            }
-
-            const profile = assembleProfile(instructionsText);
-            const result = alignmentCheck(assistantText, profile);
-
-            const alert = driftDetector.record(result);
-            const driftState = driftDetector.getState();
-
-            // Always log in observe_only for visibility
-            const responsePreview = assistantText.length > 80
-              ? `${assistantText.slice(0, 80)}...`
-              : assistantText;
-            logger.info(
-              `openviking: alignment verdict=${result.verdict} score=${result.score.toFixed(2)} ` +
-              `constraints=${profile.constraints.length} mode=${cfg.alignment.mode} ` +
-              `drift=[evaluated=${driftState.totalEvaluated},flagged=${driftState.totalFlagged},consecutive=${driftState.consecutiveFlags}] ` +
-              `response="${responsePreview}"`,
-            );
-
-            if (result.verdict !== "pass") {
-              logger.info(
-                `openviking: alignment issues: ${result.issues.map((i) => `[L${i.layer}:${i.type}] ${i.description}${i.matchedText ? ` (matched: ${i.matchedText})` : ""}`).join("; ")}`,
-              );
-              if (params.pendingAlignmentFlags) {
-                params.pendingAlignmentFlags.set(afterTurnParams.sessionId, result);
-              }
-            }
-            if (alert) {
-              warnOrInfo(
-                logger,
-                `openviking: DRIFT ALERT — mean=${alert.mean.toFixed(2)}, consecutiveFlags=${alert.consecutiveFlags}, totalEvaluated=${alert.totalEvaluated}`,
-              );
-            }
-          }
-        } catch (err) {
-          warnOrInfo(logger, `openviking: alignment check failed: ${String(err)}`);
-        }
+        warnOrInfo(logger, `openviking: afterTurn failed: ${String(err)}`);
+        diag("afterTurn_error", afterTurnParams.sessionId ?? "(unknown)", {
+          error: String(err),
+        });
       }
     },
 

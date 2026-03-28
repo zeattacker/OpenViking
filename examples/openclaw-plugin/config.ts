@@ -26,16 +26,13 @@ export type MemoryOpenVikingConfig = {
   ingestReplyAssist?: boolean;
   ingestReplyAssistMinSpeakerTurns?: number;
   ingestReplyAssistMinChars?: number;
-  profileInjection?: boolean;
-  recallFormat?: "xml" | "function_call";
-  alignment?: {
-    enabled?: boolean;
-    mode?: "observe_only" | "soft_enforce" | "full_enforce";
-    llmCheckThreshold?: number;
-    driftWindowSize?: number;
-    driftAlertThreshold?: number;
-    driftConsecutiveFlagLimit?: number;
-  };
+  /**
+   * When true (default), emit structured `openviking: diag {...}` lines (and any future
+   * standard-diagnostics file writes) for assemble/afterTurn. Set false to disable.
+   */
+  emitStandardDiagnostics?: boolean;
+  /** When true, log tenant routing for semantic find and session writes (messages/commit) to the plugin logger. */
+  logFindRequests?: boolean;
 };
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:1933";
@@ -97,6 +94,16 @@ function toNumber(value: unknown, fallback: number): number {
   return fallback;
 }
 
+/** True when env is 1 / true / yes (case-insensitive). Used for debug flags without editing plugin JSON. */
+function envFlag(name: string): boolean {
+  const v = process.env[name];
+  if (v == null || v === "") {
+    return false;
+  }
+  const t = String(v).trim().toLowerCase();
+  return t === "1" || t === "true" || t === "yes";
+}
+
 function assertAllowedKeys(value: Record<string, unknown>, allowed: string[], label: string) {
   const unknown = Object.keys(value).filter((key) => !allowed.includes(key));
   if (unknown.length === 0) {
@@ -142,9 +149,8 @@ export const memoryOpenVikingConfigSchema = {
         "ingestReplyAssist",
         "ingestReplyAssistMinSpeakerTurns",
         "ingestReplyAssistMinChars",
-        "profileInjection",
-        "recallFormat",
-        "alignment",
+        "emitStandardDiagnostics",
+        "logFindRequests",
       ],
       "openviking config",
     );
@@ -225,21 +231,14 @@ export const memoryOpenVikingConfigSchema = {
           Math.floor(toNumber(cfg.ingestReplyAssistMinChars, DEFAULT_INGEST_REPLY_ASSIST_MIN_CHARS)),
         ),
       ),
-      profileInjection: cfg.profileInjection !== false,
-      recallFormat: (cfg.recallFormat === "xml" ? "xml" : DEFAULT_RECALL_FORMAT) as "xml" | "function_call",
-      alignment: (() => {
-        const raw = (cfg.alignment && typeof cfg.alignment === "object" && !Array.isArray(cfg.alignment))
-          ? cfg.alignment as Record<string, unknown> : {};
-        return {
-          enabled: raw.enabled === true,
-          mode: (["observe_only", "soft_enforce", "full_enforce"].includes(raw.mode as string)
-            ? raw.mode : DEFAULT_ALIGNMENT.mode) as "observe_only" | "soft_enforce" | "full_enforce",
-          llmCheckThreshold: Math.max(100, Math.floor(toNumber(raw.llmCheckThreshold, DEFAULT_ALIGNMENT.llmCheckThreshold))),
-          driftWindowSize: Math.max(5, Math.min(100, Math.floor(toNumber(raw.driftWindowSize, DEFAULT_ALIGNMENT.driftWindowSize)))),
-          driftAlertThreshold: Math.max(0, Math.min(1, toNumber(raw.driftAlertThreshold, DEFAULT_ALIGNMENT.driftAlertThreshold))),
-          driftConsecutiveFlagLimit: Math.max(1, Math.floor(toNumber(raw.driftConsecutiveFlagLimit, DEFAULT_ALIGNMENT.driftConsecutiveFlagLimit))),
-        };
-      })(),
+      emitStandardDiagnostics:
+        typeof cfg.emitStandardDiagnostics === "boolean"
+          ? cfg.emitStandardDiagnostics
+          : DEFAULT_EMIT_STANDARD_DIAGNOSTICS,
+      logFindRequests:
+        cfg.logFindRequests === true ||
+        envFlag("OPENVIKING_LOG_ROUTING") ||
+        envFlag("OPENVIKING_DEBUG"),
     };
   },
   uiHints: {
@@ -266,7 +265,7 @@ export const memoryOpenVikingConfigSchema = {
     agentId: {
       label: "Agent ID",
       placeholder: "auto-generated",
-      help: "Identifies this agent to OpenViking (sent as X-OpenViking-Agent header). Defaults to \"default\" if not set.",
+      help: 'OpenViking X-OpenViking-Agent: non-default values combine with OpenClaw ctx.agentId as "<config>_<sessionAgent>" (then sanitized to [a-zA-Z0-9_-]). Use "default" to send only ctx.agentId.',
     },
     apiKey: {
       label: "OpenViking API Key",
@@ -361,6 +360,13 @@ export const memoryOpenVikingConfigSchema = {
     alignment: {
       label: "Alignment Check",
       help: 'Evaluate responses against constraints. Modes: observe_only (log), soft_enforce (block hard), full_enforce (block + correct).',
+      advanced: true,
+    },
+    logFindRequests: {
+      label: "Log find requests",
+      help:
+        "Log tenant routing: POST /api/v1/search/find (query, target_uri) and session POST .../messages + .../commit (sessionId, X-OpenViking-*). Never logs apiKey. " +
+        "Or set env OPENVIKING_LOG_ROUTING=1 or OPENVIKING_DEBUG=1 (no JSON edit). When on, local-mode OpenViking subprocess stderr is also logged at info.",
       advanced: true,
     },
   },

@@ -67,10 +67,40 @@ export class OpenVikingClient {
     private readonly apiKey: string,
     private readonly defaultAgentId: string,
     private readonly timeoutMs: number,
+    /** When set (or defaulted), sent so ROOT key can access tenant-scoped APIs. */
+    private readonly accountId: string = "",
+    private readonly userId: string = "",
+    /** When set, logs routing for find + session writes (tenant headers + paths; never apiKey). */
+    private readonly routingDebugLog?: (message: string) => void,
   ) {}
 
   getDefaultAgentId(): string {
     return this.defaultAgentId;
+  }
+
+  private async emitRoutingDebug(
+    label: string,
+    detail: Record<string, unknown>,
+    agentId?: string,
+  ): Promise<void> {
+    if (!this.routingDebugLog) {
+      return;
+    }
+    const effectiveAgentId = agentId ?? this.defaultAgentId;
+    const identity = await this.getRuntimeIdentity(agentId);
+    this.routingDebugLog(
+      `openviking: ${label} ` +
+        JSON.stringify({
+          ...detail,
+          X_OpenViking_Agent: effectiveAgentId,
+          X_OpenViking_Account: this.accountId.trim() || "default",
+          X_OpenViking_User: this.userId.trim() || "default",
+          resolved_user_id: identity.userId,
+          session_vfs_hint: detail.sessionId
+            ? `viking://session/${identity.userId}/${String(detail.sessionId)}`
+            : undefined,
+        }),
+    );
   }
 
   private async request<T>(path: string, init: RequestInit = {}, agentId?: string): Promise<T> {
@@ -82,6 +112,8 @@ export class OpenVikingClient {
       if (this.apiKey) {
         headers.set("X-API-Key", this.apiKey);
       }
+      headers.set("X-OpenViking-Account", this.accountId.trim() || "default");
+      headers.set("X-OpenViking-User", this.userId.trim() || "default");
       if (effectiveAgentId) {
         headers.set("X-OpenViking-Agent", effectiveAgentId);
       }
@@ -249,6 +281,25 @@ export class OpenVikingClient {
       limit: options.limit,
       score_threshold: options.scoreThreshold,
     };
+    const effectiveAgentId = agentId ?? this.defaultAgentId;
+    const identity = await this.getRuntimeIdentity(agentId);
+    this.routingDebugLog?.(
+      `openviking: find POST ${this.baseUrl}/api/v1/search/find ` +
+        JSON.stringify({
+          X_OpenViking_Agent: effectiveAgentId,
+          X_OpenViking_Account: this.accountId.trim() || "default",
+          X_OpenViking_User: this.userId.trim() || "default",
+          resolved_user_id: identity.userId,
+          target_uri: normalizedTargetUri,
+          target_uri_input: options.targetUri,
+          query:
+            query.length > 4000
+              ? `${query.slice(0, 4000)}…(+${query.length - 4000} more chars)`
+              : query,
+          limit: body.limit,
+          score_threshold: body.score_threshold ?? null,
+        }),
+    );
     return this.request<FindResult>("/api/v1/search/find", {
       method: "POST",
       body: JSON.stringify(body),
@@ -263,22 +314,17 @@ export class OpenVikingClient {
     );
   }
 
-  async createSession(): Promise<string> {
-    const result = await this.request<{ session_id: string }>("/api/v1/sessions", {
-      method: "POST",
-      body: JSON.stringify({}),
-    });
-    return result.session_id;
-  }
-
-  async addSessionMessage(
-    sessionId: string,
-    role: string,
-    content: string,
-    parts?: Array<Record<string, unknown>>,
-    agentId?: string,
-  ): Promise<void> {
-    const body = parts && parts.length > 0 ? { role, parts } : { role, content };
+  async addSessionMessage(sessionId: string, role: string, content: string, agentId?: string): Promise<void> {
+    await this.emitRoutingDebug(
+      "session message POST",
+      {
+        path: `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
+        sessionId,
+        role,
+        contentChars: content.length,
+      },
+      agentId,
+    );
     await this.request<{ session_id: string }>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
       {
@@ -305,27 +351,81 @@ export class OpenVikingClient {
    */
   async commitSession(
     sessionId: string,
-    options?: { wait?: boolean; agentId?: string },
-  ): Promise<{
-    session_id: string;
-    status: string;
-    task_id?: string;
-    archive_uri?: string;
-    archived?: boolean;
-    memories_extracted?: number;
-  }> {
-    const wait = options?.wait ?? false;
-    return this.request<{
-      session_id: string;
-      status: string;
-      task_id?: string;
-      archive_uri?: string;
-      archived?: boolean;
-      memories_extracted?: number;
-    }>(`/api/v1/sessions/${encodeURIComponent(sessionId)}/commit?wait=${wait}`, {
-      method: "POST",
-      body: JSON.stringify({}),
-    }, options?.agentId);
+    options?: { wait?: boolean; timeoutMs?: number; agentId?: string },
+  ): Promise<CommitSessionResult> {
+    await this.emitRoutingDebug(
+      "session commit POST (archive + memory extraction)",
+      {
+        path: `/api/v1/sessions/${encodeURIComponent(sessionId)}/commit`,
+        sessionId,
+        wait: options?.wait ?? false,
+      },
+      options?.agentId,
+    );
+    const result = await this.request<CommitSessionResult>(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/commit`,
+      { method: "POST", body: JSON.stringify({}) },
+      options?.agentId,
+    );
+
+    if (!options?.wait || !result.task_id) {
+      return result;
+    }
+
+    // Client-side poll until Phase 2 finishes
+    const deadline = Date.now() + (options.timeoutMs ?? 120_000);
+    const pollInterval = 500;
+    while (Date.now() < deadline) {
+      await sleep(pollInterval);
+      const task = await this.getTask(result.task_id, options.agentId).catch(() => null);
+      if (!task) break;
+      if (task.status === "completed") {
+        const taskResult = (task.result ?? {}) as Record<string, unknown>;
+        result.status = "completed";
+        result.memories_extracted = (taskResult.memories_extracted ?? {}) as Record<string, number>;
+        return result;
+      }
+      if (task.status === "failed") {
+        result.status = "failed";
+        result.error = task.error;
+        return result;
+      }
+    }
+    result.status = "timeout";
+    return result;
+  }
+
+  /** Poll a background task by ID. */
+  async getTask(taskId: string, agentId?: string): Promise<TaskResult> {
+    return this.request<TaskResult>(
+      `/api/v1/tasks/${encodeURIComponent(taskId)}`,
+      { method: "GET" },
+      agentId,
+    );
+  }
+
+  async getSessionContext(
+    sessionId: string,
+    tokenBudget: number = 128_000,
+    agentId?: string,
+  ): Promise<SessionContextResult> {
+    return this.request(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/context?token_budget=${tokenBudget}`,
+      { method: "GET" },
+      agentId,
+    );
+  }
+
+  async getSessionArchive(
+    sessionId: string,
+    archiveId: string,
+    agentId?: string,
+  ): Promise<SessionArchiveResult> {
+    return this.request(
+      `/api/v1/sessions/${encodeURIComponent(sessionId)}/archives/${encodeURIComponent(archiveId)}`,
+      { method: "GET" },
+      agentId,
+    );
   }
 
   async deleteSession(sessionId: string, agentId?: string): Promise<void> {
