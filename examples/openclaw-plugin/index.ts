@@ -32,7 +32,7 @@ import {
   createMemoryOpenVikingContextEngine,
   openClawSessionToOvStorageId,
 } from "./context-engine.js";
-import type { ContextEngineWithCommit } from "./context-engine.js";
+import type { ContextEngineWithCommit, ContextEngineWithSessionMapping } from "./context-engine.js";
 
 type PluginLogger = {
   debug?: (message: string) => void;
@@ -359,62 +359,6 @@ const contextEnginePlugin = {
         ),
       );
     }
-
-    let localCacheKey = "";
-    let createdPendingClientEntry = false;
-
-    try {
-      const cfg = memoryOpenVikingConfigSchema.parse(api.pluginConfig);
-      localCacheKey = `${cfg.mode}:${cfg.baseUrl}:${cfg.configPath}:${cfg.apiKey}`;
-
-      let clientPromise: Promise<OpenVikingClient>;
-      let localProcess: ReturnType<typeof spawn> | null = null;
-      let resolveLocalClient: ((c: OpenVikingClient) => void) | null = null;
-      let rejectLocalClient: ((err: unknown) => void) | null = null;
-      let localUnavailableReason: string | null = null;
-      const markLocalUnavailable = (reason: string, err?: unknown) => {
-        if (!localUnavailableReason) {
-          localUnavailableReason = reason;
-          api.logger.warn(
-            `openviking: local mode marked unavailable (${reason})${err ? `: ${String(err)}` : ""}`,
-          );
-        }
-        if (rejectLocalClient) {
-          rejectLocalClient(
-            err instanceof Error ? err : new Error(`openviking unavailable: ${reason}`),
-          );
-          rejectLocalClient = null;
-        }
-        resolveLocalClient = null;
-      };
-
-      if (cfg.mode === "local") {
-        const cached = localClientCache.get(localCacheKey);
-        if (cached) {
-          localProcess = cached.process;
-          clientPromise = Promise.resolve(cached.client);
-        } else {
-          const existingPending = localClientPendingPromises.get(localCacheKey);
-          if (existingPending) {
-            clientPromise = existingPending.promise;
-          } else {
-            const entry = {} as PendingClientEntry;
-            entry.promise = new Promise<OpenVikingClient>((resolve, reject) => {
-              entry.resolve = resolve;
-              entry.reject = reject;
-            });
-            clientPromise = entry.promise;
-            localClientPendingPromises.set(localCacheKey, entry);
-            createdPendingClientEntry = true;
-          }
-        }
-      } else {
-        clientPromise = Promise.resolve(
-          new OpenVikingClient(cfg.baseUrl, cfg.apiKey, cfg.agentId, cfg.timeoutMs),
-        );
-      }
-
-      const getClient = (): Promise<OpenVikingClient> => clientPromise;
 
     api.registerTool(
       (ctx: ToolContext) => ({
@@ -744,6 +688,7 @@ const contextEnginePlugin = {
         rememberSessionAgentId(ctx);
         const archiveId = String((params as { archiveId?: string }).archiveId ?? "").trim();
         const sessionId = ctx.sessionId ?? "";
+        const sessionKey = ctx.sessionKey ?? "";
         api.logger.info?.(`openviking: ov_archive_expand invoked (archiveId=${archiveId || "(empty)"}, sessionId=${sessionId || "(empty)"})`);
 
         if (!archiveId) {
@@ -753,9 +698,6 @@ const contextEnginePlugin = {
             details: { error: "missing_param", param: "archiveId" },
           };
         }
-
-        const sessionId = ctx.sessionId ?? "";
-        const sessionKey = ctx.sessionKey ?? "";
         if (!sessionId && !sessionKey) {
           return {
             content: [{ type: "text", text: "Error: no active session." }],
@@ -809,7 +751,8 @@ const contextEnginePlugin = {
       },
     }));
 
-    let contextEngineRef: ContextEngineWithCommit | null = null;
+    const pendingAlignmentFlags = new Map<string, AlignmentResult>();
+    let contextEngineRef: ContextEngineWithSessionMapping | null = null;
     const sessionAgentResolver = createSessionAgentResolver(cfg.agentId);
     const rememberSessionAgentId = (ctx: SessionAgentLookup) => {
       sessionAgentResolver.remember(ctx);
@@ -1071,6 +1014,7 @@ const contextEnginePlugin = {
           getClient,
           resolveAgentId,
           rememberSessionAgentId,
+          pendingAlignmentFlags,
         });
         return contextEngineRef;
       });
@@ -1284,30 +1228,17 @@ const contextEnginePlugin = {
         }
         },
         stop: () => {
-          try {
-            if (localProcess) {
-              localProcess.kill("SIGTERM");
-              localClientCache.delete(localCacheKey);
-              localClientPendingPromises.delete(localCacheKey);
-              localProcess = null;
-              api.logger.info("openviking: local server stopped");
-            } else {
-              api.logger.info("openviking: stopped");
-            }
-          } finally {
-            resetPluginRegistration(registrationToken);
+          if (localProcess) {
+            localProcess.kill("SIGTERM");
+            localClientCache.delete(localCacheKey);
+            localClientPendingPromises.delete(localCacheKey);
+            localProcess = null;
+            api.logger.info("openviking: local server stopped");
+          } else {
+            api.logger.info("openviking: stopped");
           }
         },
       });
-
-      commitPluginRegistration(registrationToken);
-    } catch (err) {
-      if (createdPendingClientEntry && localCacheKey) {
-        localClientPendingPromises.delete(localCacheKey);
-      }
-      rollbackPluginRegistration(registrationToken);
-      throw err;
-    }
   },
 };
 

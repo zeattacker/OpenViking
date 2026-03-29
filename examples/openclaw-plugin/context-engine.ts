@@ -106,6 +106,10 @@ function estimateTokens(messages: AgentMessage[]): number {
   return Math.max(1, messages.length * 80);
 }
 
+export function roughEstimate(messages: AgentMessage[]): number {
+  return Math.ceil(JSON.stringify(messages).length / 4);
+}
+
 async function tryLegacyCompact(params: {
   sessionId: string;
   sessionFile: string;
@@ -120,8 +124,22 @@ async function tryLegacyCompact(params: {
     "openclaw/context-engine/legacy",
     "openclaw/dist/context-engine/legacy.js",
   ];
+  for (const modPath of candidates) {
+    try {
+      const mod = await import(modPath);
+      if (!mod?.LegacyContextEngine) {
+        continue;
+      }
+      const legacy = new mod.LegacyContextEngine();
+      return legacy.compact(params);
+    } catch {
+      // continue
+    }
+  }
+  return null;
+}
 
-function msgTokenEstimate(msg: AgentMessage): number {
+export function msgTokenEstimate(msg: AgentMessage): number {
   const raw = (msg as Record<string, unknown>).content;
   if (typeof raw === "string") return Math.ceil(raw.length / 4);
   if (Array.isArray(raw)) return Math.ceil(JSON.stringify(raw).length / 4);
@@ -233,7 +251,7 @@ export function openClawSessionRefToOvStorageId(ref: string): string {
  * 1. The assistant message with toolUse blocks in its content array
  * 2. A separate toolResult message per ToolPart (carrying tool_output)
  */
-function convertToAgentMessages(msg: { role: string; parts: unknown[] }): AgentMessage[] {
+export function convertToAgentMessages(msg: { role: string; parts: unknown[] }): AgentMessage[] {
   const parts = msg.parts ?? [];
   const contentBlocks: Record<string, unknown>[] = [];
   const toolResults: AgentMessage[] = [];
@@ -316,7 +334,7 @@ function convertToAgentMessages(msg: { role: string; parts: unknown[] }): AgentM
   return result;
 }
 
-function normalizeAssistantContent(messages: AgentMessage[]): void {
+export function normalizeAssistantContent(messages: AgentMessage[]): void {
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     if (msg?.role === "assistant" && typeof msg.content === "string") {
@@ -324,17 +342,85 @@ function normalizeAssistantContent(messages: AgentMessage[]): void {
         ...msg,
         content: [{ type: "text", text: msg.content }],
       };
-      if (!mod?.LegacyContextEngine) {
-        continue;
+    }
+  }
+}
+
+export function formatMessageFaithful(msg: OVMessage): string {
+  const roleTag = `[${msg.role}]`;
+  if (!msg.parts || msg.parts.length === 0) {
+    return `${roleTag}: (empty)`;
+  }
+
+  const sections: string[] = [];
+  for (const part of msg.parts) {
+    if (!part || typeof part !== "object") continue;
+    switch (part.type) {
+      case "text":
+        if (part.text) sections.push(part.text);
+        break;
+      case "tool": {
+        const status = part.tool_status ?? "unknown";
+        const header = `[Tool: ${part.tool_name ?? "unknown"}] (${status})`;
+        const inputStr = part.tool_input
+          ? `Input: ${JSON.stringify(part.tool_input, null, 2)}`
+          : "";
+        const outputStr = part.tool_output ? `Output:\n${part.tool_output}` : "";
+        sections.push([header, inputStr, outputStr].filter(Boolean).join("\n"));
+        break;
       }
-      const legacy = new mod.LegacyContextEngine();
-      return legacy.compact(params);
-    } catch {
-      // continue
+      case "context":
+        sections.push(
+          `[Context: ${part.uri ?? "?"}]${part.abstract ? ` ${part.abstract}` : ""}`,
+        );
+        break;
+      default:
+        sections.push(`[${part.type}]: ${JSON.stringify(part)}`);
     }
   }
 
-  return null;
+  return `${roleTag}:\n${sections.join("\n\n")}`;
+}
+
+export function buildSystemPromptAddition(): string {
+  return [
+    "## Session Context Guide",
+    "",
+    "Your conversation history may include:",
+    "",
+    "1. **[Session History Summary]** — A compressed summary of all prior",
+    "   conversation sessions. Use it to understand background and continuity.",
+    "   It is lossy: specific details (commands, file paths, code, config",
+    "   values) may have been compressed away. It may be omitted when the",
+    "   token budget is tight.",
+    "",
+    "2. **[Archive Index]** — A list of archive entries in chronological order",
+    "   (archive_001 is the oldest, higher numbers are more recent). Most",
+    "   lines summarize one archive; the latest archive may appear as an ID",
+    "   pointer only.",
+    "",
+    "3. **Active messages** — The current, uncompressed conversation.",
+    "",
+    "**When you need precise details from a prior session:**",
+    "",
+    "1. Review [Archive Index] to identify which archive likely contains",
+    "   the information you need.",
+    "2. Call `ov_archive_expand` with that archive ID to retrieve the",
+    "   archived conversation content.",
+    "3. If multiple archives look relevant, try the most recent one first.",
+    "4. Answer using the retrieved content together with active messages.",
+    "",
+    "**Rules:**",
+    "- If active messages conflict with archive content, trust active",
+    "  messages as the newer source of truth.",
+    "- Only expand an archive when the existing context lacks the specific detail needed.",
+    "- If [Session History Summary] is absent, use [Archive Index] and active",
+    "  messages to decide whether to expand an archive.",
+    "- Do not fabricate details from summaries. When uncertain, expand first",
+    "  or state that the information comes from a compressed summary.",
+    "- After expanding, cite the archive ID in your answer",
+    '  (e.g. "Based on archive_003, ...").',
+  ].join("\n");
 }
 
 function warnOrInfo(logger: Logger, message: string): void {
@@ -705,20 +791,25 @@ export function createMemoryOpenVikingContextEngine(params: {
           afterTurnParams.sessionId ?? sessionKey ?? OVSessionId;
         const agentId = resolveAgentId(routingRef, sessionKey, OVSessionId);
 
-      // Exponential backoff after consecutive failures
-      if (_consecutiveCaptureFailures >= MAX_CONSECUTIVE_FAILURES) {
-        const backoffMs = CAPTURE_COOLDOWN_MS * Math.pow(2, _consecutiveCaptureFailures - MAX_CONSECUTIVE_FAILURES);
-        if (now - lastCapture < backoffMs) {
+        // Cooldown: skip if last successful capture was too recent
+        const now = Date.now();
+        const lastCapture = _sessionLastCapture.get(OVSessionId) ?? 0;
+
+        // Exponential backoff after consecutive failures
+        if (_consecutiveCaptureFailures >= MAX_CONSECUTIVE_FAILURES) {
+          const backoffMs = CAPTURE_COOLDOWN_MS * Math.pow(2, _consecutiveCaptureFailures - MAX_CONSECUTIVE_FAILURES);
+          if (now - lastCapture < backoffMs) {
+            logger.info(
+              `openviking: auto-capture skipped (backoff after ${_consecutiveCaptureFailures} failures, ${Math.round((backoffMs - (now - lastCapture)) / 1000)}s remaining)`,
+            );
+            return;
+          }
+        } else if (now - lastCapture < CAPTURE_COOLDOWN_MS) {
           logger.info(
-            `openviking: auto-capture skipped (backoff after ${_consecutiveCaptureFailures} failures, ${Math.round((backoffMs - (now - lastCapture)) / 1000)}s remaining)`,
+            `openviking: auto-capture skipped (cooldown, ${Math.round((CAPTURE_COOLDOWN_MS - (now - lastCapture)) / 1000)}s remaining)`,
           );
           return;
         }
-      }
-
-      try {
-        const sessionKey = extractSessionKey(afterTurnParams.runtimeContext);
-        const agentId = resolveAgentId(sessionKey ?? afterTurnParams.sessionId);
 
         // Sync agent instructions (system prompt) to OpenViking for alignment check
         const messages = afterTurnParams.messages ?? [];
@@ -729,14 +820,15 @@ export function createMemoryOpenVikingContextEngine(params: {
           const sysContent = typeof systemMsg?.content === "string" ? systemMsg.content : "";
           if (sysContent.length > 20) {
             const hash = createHash("md5").update(sysContent).digest("hex").slice(0, 16);
-            const cached = _instructionsSyncedHash.get(sessionKey);
+            const cacheKey = sessionKey ?? OVSessionId;
+            const cached = _instructionsSyncedHash.get(cacheKey);
             if (cached !== hash) {
               const syncClient = await getClient();
               await syncClient.writeFile(
                 "viking://agent/instructions/system_prompt.md",
                 sysContent,
               );
-              _instructionsSyncedHash.set(sessionKey, hash);
+              _instructionsSyncedHash.set(cacheKey, hash);
               logger.info(`openviking: synced agent instructions (hash=${hash}, len=${sysContent.length})`);
               // Prune old entries
               if (_instructionsSyncedHash.size > 200) {
@@ -750,6 +842,7 @@ export function createMemoryOpenVikingContextEngine(params: {
         } catch (err) {
           logger.info(`openviking: instructions sync skipped: ${String(err)}`);
         }
+
         if (messages.length === 0) {
           diag("afterTurn_skip", OVSessionId, {
             reason: "no_messages",
@@ -789,52 +882,36 @@ export function createMemoryOpenVikingContextEngine(params: {
           return;
         }
 
-        // Use structured turn messages for richer session ingestion (includes tool calls)
-        const { turns } = extractNewTurnMessages(messages, start);
-
         const client = await getClient();
-        const ovSessionId = sessionKey
-          ? mapSessionKeyToOVSessionId(sessionKey)
-          : afterTurnParams.sessionId;
-        const sessionId = await client.createSession(ovSessionId);
-        try {
-          // Ingest structured turns: send tool calls as structured ToolPart for skill extraction
-          if (turns.length > 0) {
-            for (const turn of turns) {
-              if (turn.toolCalls?.length) {
-                // Build structured parts: text content + tool parts
-                const parts: Array<Record<string, unknown>> = [];
-                if (turn.content.trim()) {
-                  parts.push({ type: "text", text: turn.content.trim() });
-                }
-                for (const tc of turn.toolCalls) {
-                  let toolInput: unknown;
-                  try { toolInput = JSON.parse(tc.input); } catch { toolInput = { raw: tc.input }; }
-                  parts.push({
-                    type: "tool",
-                    tool_name: tc.name,
-                    tool_input: toolInput,
-                    tool_output: (tc.result ?? "").slice(0, 1000),
-                    tool_status: tc.result !== undefined ? "completed" : "pending",
-                    skill_uri: buildSkillUri(tc.name),
-                  });
-                }
-                if (parts.length > 0) {
-                  await client.addSessionMessage(sessionId, turn.role, "", parts, agentId);
-                }
-              } else if (turn.content.trim()) {
-                await client.addSessionMessage(sessionId, turn.role, turn.content.trim(), undefined, agentId);
-              }
-            }
-          } else {
-            // Fallback to flat text if structured extraction yielded nothing
-            await client.addSessionMessage(sessionId, "user", decision.normalizedText, undefined, agentId);
-          }
-          await client.getSession(sessionId, agentId).catch(() => ({}));
-          const commitResult = await client.commitSession(sessionId, { wait: true, agentId });
 
-        if (sanitized) {
-          await client.addSessionMessage(OVSessionId, "user", sanitized, agentId);
+        // Ingest structured turn messages (includes tool calls as ToolPart for skill extraction)
+        const { turns } = extractNewTurnMessages(messages, start);
+        if (turns.length > 0) {
+          for (const turn of turns) {
+            if (turn.toolCalls?.length) {
+              // Build structured content: text + serialized tool call summaries
+              const segments: string[] = [];
+              if (turn.content.trim()) {
+                segments.push(turn.content.trim());
+              }
+              for (const tc of turn.toolCalls) {
+                const output = (tc.result ?? "").slice(0, 1000);
+                const status = tc.result !== undefined ? "completed" : "pending";
+                segments.push(
+                  `[${tc.name}] (${status}) uri=${buildSkillUri(tc.name)}\n` +
+                    `Input: ${tc.input}\nOutput: ${output}`,
+                );
+              }
+              if (segments.length > 0) {
+                await client.addSessionMessage(OVSessionId, turn.role, segments.join("\n"), agentId);
+              }
+            } else if (turn.content.trim()) {
+              await client.addSessionMessage(OVSessionId, turn.role, turn.content.trim(), agentId);
+            }
+          }
+        } else if (decision.normalizedText) {
+          // Fallback to flat text if structured extraction yielded nothing
+          await client.addSessionMessage(OVSessionId, "user", decision.normalizedText, agentId);
         } else {
           diag("afterTurn_skip", OVSessionId, {
             reason: "sanitized_empty",
@@ -843,7 +920,7 @@ export function createMemoryOpenVikingContextEngine(params: {
         }
 
         const session = await client.getSession(OVSessionId, agentId);
-        const pendingTokens = session.pending_tokens ?? 0;
+        const pendingTokens = (session as Record<string, unknown>).pending_tokens as number ?? 0;
 
         if (pendingTokens < cfg.commitTokenThreshold) {
           diag("afterTurn_skip", OVSessionId, {
@@ -851,6 +928,9 @@ export function createMemoryOpenVikingContextEngine(params: {
             pendingTokens,
             commitTokenThreshold: cfg.commitTokenThreshold,
           });
+          // Mark successful capture even without commit (messages were ingested)
+          _sessionLastCapture.set(OVSessionId, Date.now());
+          _consecutiveCaptureFailures = 0;
           return;
         }
 
@@ -872,25 +952,30 @@ export function createMemoryOpenVikingContextEngine(params: {
           taskId: commitResult.task_id ?? null,
           extractedMemories: (commitResult as any).extracted_memories ?? null,
         });
+
+        // Mark successful capture + reset failure counter
+        _sessionLastCapture.set(OVSessionId, Date.now());
+        _consecutiveCaptureFailures = 0;
+
         if (commitResult.task_id && cfg.logFindRequests) {
           logger.info(
             `openviking: Phase2 memory extraction runs asynchronously on the server (task_id=${commitResult.task_id}). ` +
               "memories_extracted appears only after that task completes — not in this immediate response.",
           );
-          if (cfg.logFindRequests) {
-            void pollPhase2ExtractionOutcome(
-              getClient,
-              commitResult.task_id,
-              agentId,
-              logger,
-              OVSessionId,
-            );
-          }
+          void pollPhase2ExtractionOutcome(
+            getClient,
+            commitResult.task_id,
+            agentId,
+            logger,
+            OVSessionId,
+          );
         }
       } catch (err) {
+        _consecutiveCaptureFailures++;
         warnOrInfo(logger, `openviking: afterTurn failed: ${String(err)}`);
         diag("afterTurn_error", afterTurnParams.sessionId ?? "(unknown)", {
           error: String(err),
+          consecutiveFailures: _consecutiveCaptureFailures,
         });
       }
     },

@@ -23,9 +23,20 @@ export type MemoryOpenVikingConfig = {
   recallMaxContentChars?: number;
   recallPreferAbstract?: boolean;
   recallTokenBudget?: number;
+  commitTokenThreshold?: number;
   ingestReplyAssist?: boolean;
   ingestReplyAssistMinSpeakerTurns?: number;
   ingestReplyAssistMinChars?: number;
+  profileInjection?: boolean;
+  recallFormat?: "xml" | "function_call";
+  alignment?: {
+    enabled?: boolean;
+    mode?: "observe_only" | "soft_enforce" | "full_enforce";
+    llmCheckThreshold?: number;
+    driftWindowSize?: number;
+    driftAlertThreshold?: number;
+    driftConsecutiveFlagLimit?: number;
+  };
   /**
    * When true (default), emit structured `openviking: diag {...}` lines (and any future
    * standard-diagnostics file writes) for assemble/afterTurn. Set false to disable.
@@ -47,6 +58,7 @@ const DEFAULT_RECALL_MAX_CONTENT_CHARS = 500;
 const DEFAULT_RECALL_PREFER_ABSTRACT = true;
 const DEFAULT_RECALL_TOKEN_BUDGET = 2000;
 const DEFAULT_COMMIT_TOKEN_THRESHOLD = 20000;
+const DEFAULT_EMIT_STANDARD_DIAGNOSTICS = false;
 const DEFAULT_INGEST_REPLY_ASSIST = true;
 const DEFAULT_INGEST_REPLY_ASSIST_MIN_SPEAKER_TURNS = 2;
 const DEFAULT_INGEST_REPLY_ASSIST_MIN_CHARS = 120;
@@ -148,7 +160,11 @@ export const memoryOpenVikingConfigSchema = {
         "recallTokenBudget",
         "ingestReplyAssist",
         "ingestReplyAssistMinSpeakerTurns",
+        "commitTokenThreshold",
         "ingestReplyAssistMinChars",
+        "profileInjection",
+        "recallFormat",
+        "alignment",
         "emitStandardDiagnostics",
         "logFindRequests",
       ],
@@ -211,6 +227,10 @@ export const memoryOpenVikingConfigSchema = {
         100,
         Math.min(50000, Math.floor(toNumber(cfg.recallTokenBudget, DEFAULT_RECALL_TOKEN_BUDGET))),
       ),
+      commitTokenThreshold: Math.max(
+        0,
+        Math.min(100_000, Math.floor(toNumber(cfg.commitTokenThreshold, DEFAULT_COMMIT_TOKEN_THRESHOLD))),
+      ),
       ingestReplyAssist: cfg.ingestReplyAssist !== false,
       ingestReplyAssistMinSpeakerTurns: Math.max(
         1,
@@ -231,6 +251,21 @@ export const memoryOpenVikingConfigSchema = {
           Math.floor(toNumber(cfg.ingestReplyAssistMinChars, DEFAULT_INGEST_REPLY_ASSIST_MIN_CHARS)),
         ),
       ),
+      profileInjection: cfg.profileInjection !== false,
+      recallFormat: (cfg.recallFormat === "xml" ? "xml" : DEFAULT_RECALL_FORMAT) as "xml" | "function_call",
+      alignment: (() => {
+        const raw = (cfg.alignment && typeof cfg.alignment === "object" && !Array.isArray(cfg.alignment))
+          ? cfg.alignment as Record<string, unknown> : {};
+        return {
+          enabled: raw.enabled === true,
+          mode: (["observe_only", "soft_enforce", "full_enforce"].includes(raw.mode as string)
+            ? raw.mode : DEFAULT_ALIGNMENT.mode) as "observe_only" | "soft_enforce" | "full_enforce",
+          llmCheckThreshold: Math.max(100, Math.floor(toNumber(raw.llmCheckThreshold, DEFAULT_ALIGNMENT.llmCheckThreshold))),
+          driftWindowSize: Math.max(5, Math.min(100, Math.floor(toNumber(raw.driftWindowSize, DEFAULT_ALIGNMENT.driftWindowSize)))),
+          driftAlertThreshold: Math.max(0, Math.min(1, toNumber(raw.driftAlertThreshold, DEFAULT_ALIGNMENT.driftAlertThreshold))),
+          driftConsecutiveFlagLimit: Math.max(1, Math.floor(toNumber(raw.driftConsecutiveFlagLimit, DEFAULT_ALIGNMENT.driftConsecutiveFlagLimit))),
+        };
+      })(),
       emitStandardDiagnostics:
         typeof cfg.emitStandardDiagnostics === "boolean"
           ? cfg.emitStandardDiagnostics
@@ -340,6 +375,12 @@ export const memoryOpenVikingConfigSchema = {
       placeholder: String(DEFAULT_INGEST_REPLY_ASSIST_MIN_SPEAKER_TURNS),
       help: "Minimum speaker-tag turns (e.g. Name:) to detect transcript-like ingest text.",
       advanced: true,
+    },
+    commitTokenThreshold: {
+      label: "Commit Token Threshold",
+      placeholder: String(DEFAULT_COMMIT_TOKEN_THRESHOLD),
+      advanced: true,
+      help: "Pending token count in a session before auto-commit triggers. Set 0 to disable auto-commit.",
     },
     ingestReplyAssistMinChars: {
       label: "Ingest Min Chars",
