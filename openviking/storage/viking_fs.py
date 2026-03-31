@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0
 """
 VikingFS: OpenViking file system abstraction layer
 
@@ -23,6 +23,7 @@ from datetime import datetime
 from pathlib import PurePath
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
+from openviking.pyagfs.exceptions import AGFSClientError, AGFSHTTPError
 from openviking.server.identity import RequestContext, Role
 from openviking.telemetry import get_current_telemetry
 from openviking.utils.time_utils import format_simplified, get_current_timestamp, parse_iso_datetime
@@ -1380,7 +1381,7 @@ class VikingFS:
     ) -> None:
         """Update URIs in vector store (when moving files).
 
-        Preserves vector data, only updates uri and parent_uri fields, no need to regenerate embeddings.
+        Preserves vector data and updates URI-derived identifiers without regenerating embeddings.
         """
         vector_store = self._get_vector_store()
         if not vector_store:
@@ -1392,13 +1393,11 @@ class VikingFS:
         for uri in uris:
             try:
                 new_uri = uri.replace(old_base_uri, new_base_uri, 1)
-                new_parent_uri = VikingURI(new_uri).parent.uri
 
                 await vector_store.update_uri_mapping(
                     ctx=self._ctx_or_default(ctx),
                     uri=uri,
                     new_uri=new_uri,
-                    new_parent_uri=new_parent_uri,
                     levels=levels,
                 )
                 logger.debug(f"[VikingFS] Updated URI: {uri} -> {new_uri}")
@@ -1667,8 +1666,11 @@ class VikingFS:
                 existing_bytes = self._handle_agfs_read(self.agfs.read(path))
                 existing_bytes = await self._decrypt_content(existing_bytes, ctx=ctx)
                 existing = self._decode_bytes(existing_bytes)
-            except Exception:
-                pass
+            except AGFSHTTPError as e:
+                if e.status_code != 404:
+                    raise
+            except AGFSClientError:
+                raise
 
             await self._ensure_parent_dirs(path)
             final_content = (existing + content).encode("utf-8")

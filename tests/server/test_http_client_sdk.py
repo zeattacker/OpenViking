@@ -1,13 +1,14 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0
 
 """SDK tests using AsyncHTTPClient against a real uvicorn server."""
 
+import asyncio
 import io
 import zipfile
-import asyncio
-import pytest_asyncio
+
 import pytest
+import pytest_asyncio
 
 from openviking_cli.client.http import AsyncHTTPClient
 from openviking_cli.exceptions import FailedPreconditionError
@@ -73,6 +74,29 @@ description: SDK localhost upload test
     assert result["uri"].startswith("viking://agent/skills/")
 
 
+def _build_ovpack_bytes() -> bytes:
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as zf:
+        zf.writestr("pkg/_._meta.json", '{"uri": "viking://resources/pkg"}')
+        zf.writestr("pkg/content.md", "# Demo\n")
+    return buffer.getvalue()
+
+
+async def test_sdk_import_ovpack_from_local_file(http_client):
+    client, _ = http_client
+    f = TEST_TMP_DIR / "sdk_import.ovpack"
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_bytes(_build_ovpack_bytes())
+
+    uri = await client.import_ovpack(
+        str(f),
+        parent="viking://resources/imported/",
+        force=True,
+        vectorize=False,
+    )
+    assert uri.startswith("viking://resources/imported/")
+
+
 async def test_sdk_wait_processed(http_client):
     client, _ = http_client
     result = await client.wait_processed()
@@ -126,7 +150,6 @@ async def test_sdk_session_lifecycle(http_client):
 
     context = await client.get_session_context(session_id)
     assert context["latest_archive_overview"] == ""
-    assert context["latest_archive_id"] == ""
     assert context["pre_archive_abstracts"] == []
     assert [m["parts"][0]["text"] for m in context["messages"]] == ["Hello from SDK"]
 

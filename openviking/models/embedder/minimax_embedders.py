@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0
 """MiniMax Embedder Implementation via HTTP API"""
 
 from typing import Any, Dict, List, Optional
@@ -90,8 +90,8 @@ class MinimaxDenseEmbedder(DenseEmbedderBase):
         """Create a requests session with retry logic"""
         session = requests.Session()
         retry_strategy = Retry(
-            total=6,
-            backoff_factor=1,  # 1s, 2s, 4s, 8s, 16s, 32s
+            total=self.max_retries,
+            backoff_factor=0.5,
             status_forcelist=[429, 500, 502, 503, 504],
             allowed_methods=["POST"],
         )

@@ -1,5 +1,5 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0
 """SemanticProcessor: Processes messages from SemanticQueue, generates .abstract.md and .overview.md."""
 
 import asyncio
@@ -748,6 +748,11 @@ class SemanticProcessor(DequeueHandlerBase):
             logger.warning("VLM not available, using empty summary")
             return {"name": file_name, "summary": ""}
 
+        from openviking.session.memory.utils.language import _detect_language_from_text
+
+        fallback_language = (get_openviking_config().language_fallback or "en").strip() or "en"
+        output_language = _detect_language_from_text(content, fallback_language)
+
         # Detect file type and select appropriate prompt
         file_type = self._detect_file_type(file_name)
 
@@ -768,7 +773,11 @@ class SemanticProcessor(DequeueHandlerBase):
                     else:  # ast_llm
                         prompt = render_prompt(
                             "semantic.code_ast_summary",
-                            {"file_name": file_name, "skeleton": skeleton_text},
+                            {
+                                "file_name": file_name,
+                                "skeleton": skeleton_text,
+                                "output_language": output_language,
+                            },
                         )
                         async with llm_sem:
                             summary = await vlm.get_completion_async(prompt)
@@ -781,7 +790,7 @@ class SemanticProcessor(DequeueHandlerBase):
             # "llm" mode or fallback when skeleton is None/empty
             prompt = render_prompt(
                 "semantic.code_summary",
-                {"file_name": file_name, "content": content},
+                {"file_name": file_name, "content": content, "output_language": output_language},
             )
             async with llm_sem:
                 summary = await vlm.get_completion_async(prompt)
@@ -794,7 +803,7 @@ class SemanticProcessor(DequeueHandlerBase):
 
         prompt = render_prompt(
             prompt_id,
-            {"file_name": file_name, "content": content},
+            {"file_name": file_name, "content": content, "output_language": output_language},
         )
 
         async with llm_sem:
@@ -962,6 +971,10 @@ class SemanticProcessor(DequeueHandlerBase):
             logger.warning("VLM not available, using default overview")
             return f"# {dir_uri.split('/')[-1]}\n\nDirectory overview"
 
+        from openviking.session.memory.utils.language import _detect_language_from_text
+
+        fallback_language = (config.language_fallback or "en").strip() or "en"
+
         # Build file index mapping and summary string
         file_index_map = {}
         file_summaries_lines = []
@@ -969,6 +982,8 @@ class SemanticProcessor(DequeueHandlerBase):
             file_index_map[idx] = item["name"]
             file_summaries_lines.append(f"[{idx}] {item['name']}: {item['summary']}")
         file_summaries_str = "\n".join(file_summaries_lines) if file_summaries_lines else "None"
+
+        output_language = _detect_language_from_text(file_summaries_str, fallback_language)
 
         # Build subdirectory summary string
         children_abstracts_str = (
@@ -995,6 +1010,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 children_abstracts,
                 file_index_map,
                 llm_sem=llm_sem,
+                output_language=output_language,
             )
         elif over_budget:
             # Few files but long summaries → truncate summaries to fit budget
@@ -1016,6 +1032,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 file_summaries_str,
                 children_abstracts_str,
                 file_index_map,
+                output_language=output_language,
             )
         else:
             overview = await self._single_generate_overview(
@@ -1023,6 +1040,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 file_summaries_str,
                 children_abstracts_str,
                 file_index_map,
+                output_language=output_language,
             )
 
         return overview
@@ -1033,6 +1051,7 @@ class SemanticProcessor(DequeueHandlerBase):
         file_summaries_str: str,
         children_abstracts_str: str,
         file_index_map: Dict[int, str],
+        output_language: str = "en",
     ) -> str:
         """Generate overview from a single prompt (small directories)."""
         import re
@@ -1046,6 +1065,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     "dir_name": dir_uri.split("/")[-1],
                     "file_summaries": file_summaries_str,
                     "children_abstracts": children_abstracts_str,
+                    "output_language": output_language,
                 },
             )
 
@@ -1074,6 +1094,7 @@ class SemanticProcessor(DequeueHandlerBase):
         children_abstracts: List[Dict[str, str]],
         file_index_map: Dict[int, str],
         llm_sem: Optional[asyncio.Semaphore] = None,
+        output_language: str = "en",
     ) -> str:
         """Generate overview by batching file summaries and merging.
 
@@ -1127,6 +1148,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     "dir_name": dir_name,
                     "file_summaries": batch_str,
                     "children_abstracts": children_str,
+                    "output_language": output_language,
                 },
             )
             batch_prompts.append((batch_idx, prompt, batch_index_map))
@@ -1169,6 +1191,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     "dir_name": dir_name,
                     "file_summaries": combined,
                     "children_abstracts": children_abstracts_str,
+                    "output_language": output_language,
                 },
             )
             overview = await vlm.get_completion_async(prompt)

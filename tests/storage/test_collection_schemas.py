@@ -1,14 +1,21 @@
 # Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
-# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: AGPL-3.0
 
+import inspect
 import json
 from types import SimpleNamespace
 
 import pytest
 
 from openviking.models.embedder.base import EmbedResult
-from openviking.storage.collection_schemas import TextEmbeddingHandler
+from openviking.storage.collection_schemas import (
+    CollectionSchemas,
+    TextEmbeddingHandler,
+    init_context_collection,
+)
 from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
+from openviking.storage.viking_vector_index_backend import _SingleAccountBackend
+from openviking_cli.utils.config.vectordb_config import VectorDBBackendConfig
 
 
 class _DummyEmbedder:
@@ -21,8 +28,8 @@ class _DummyEmbedder:
 
 
 class _DummyConfig:
-    def __init__(self, embedder: _DummyEmbedder):
-        self.storage = SimpleNamespace(vectordb=SimpleNamespace(name="context"))
+    def __init__(self, embedder: _DummyEmbedder, backend: str = "volcengine"):
+        self.storage = SimpleNamespace(vectordb=SimpleNamespace(name="context", backend=backend))
         self.embedding = SimpleNamespace(
             dimension=2,
             get_embedder=lambda: embedder,
@@ -104,3 +111,192 @@ async def test_embedding_handler_treats_shutdown_write_lock_as_success(monkeypat
     assert embedder.calls == 1
     assert status["success"] == 1
     assert status["error"] == 0
+
+
+@pytest.mark.asyncio
+async def test_embedding_handler_preserves_parent_uri_for_backend_upsert_logic(monkeypatch):
+    captured = {}
+
+    class _CapturingVikingDB:
+        is_closing = False
+        mode = "local"
+
+        async def upsert(self, data, *, ctx):
+            captured["data"] = dict(data)
+            return "rec-1"
+
+    embedder = _DummyEmbedder()
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: _DummyConfig(embedder),
+    )
+
+    handler = TextEmbeddingHandler(_CapturingVikingDB())
+    payload = _build_queue_payload()
+    queue_data = json.loads(payload["data"])
+    queue_data["context_data"]["parent_uri"] = "viking://resources"
+    payload["data"] = json.dumps(queue_data)
+
+    result = await handler.on_dequeue(payload)
+
+    assert result is not None
+    assert "data" in captured
+    assert captured["data"]["parent_uri"] == "viking://resources"
+
+
+def test_context_collection_excludes_parent_uri():
+    schema = CollectionSchemas.context_collection("ctx", 8)
+
+    field_names = [field["FieldName"] for field in schema["Fields"]]
+
+    assert "parent_uri" not in field_names
+    assert "parent_uri" not in schema["ScalarIndex"]
+
+
+def test_context_collection_signature_has_no_include_parent_uri():
+    signature = inspect.signature(CollectionSchemas.context_collection)
+
+    assert "include_parent_uri" not in signature.parameters
+
+
+@pytest.mark.asyncio
+async def test_init_context_collection_uses_backend_specific_schema(monkeypatch):
+    captured = {}
+
+    class _Storage:
+        async def create_collection(self, name, schema):
+            captured["name"] = name
+            captured["schema"] = schema
+            return True
+
+    embedder = _DummyEmbedder()
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: _DummyConfig(embedder, backend="volcengine"),
+    )
+
+    created = await init_context_collection(_Storage())
+
+    assert created is True
+    field_names = [field["FieldName"] for field in captured["schema"]["Fields"]]
+    assert "parent_uri" not in field_names
+    assert "parent_uri" not in captured["schema"]["ScalarIndex"]
+
+
+@pytest.mark.asyncio
+async def test_init_context_collection_excludes_parent_uri_for_local_backend(monkeypatch):
+    captured = {}
+
+    class _Storage:
+        async def create_collection(self, name, schema):
+            captured["name"] = name
+            captured["schema"] = schema
+            return True
+
+    embedder = _DummyEmbedder()
+    monkeypatch.setattr(
+        "openviking_cli.utils.config.get_openviking_config",
+        lambda: _DummyConfig(embedder, backend="local"),
+    )
+
+    created = await init_context_collection(_Storage())
+
+    assert created is True
+    field_names = [field["FieldName"] for field in captured["schema"]["Fields"]]
+    assert "parent_uri" not in field_names
+    assert "parent_uri" not in captured["schema"]["ScalarIndex"]
+
+
+def test_single_account_backend_filters_parent_uri_against_current_schema():
+    class _Collection:
+        def get_meta_data(self):
+            return {
+                "Fields": [
+                    {"FieldName": "id"},
+                    {"FieldName": "uri"},
+                    {"FieldName": "abstract"},
+                    {"FieldName": "account_id"},
+                ]
+            }
+
+    class _Adapter:
+        mode = "local"
+
+        def get_collection(self):
+            return _Collection()
+
+    backend = _SingleAccountBackend(
+        config=VectorDBBackendConfig(backend="local", name="context", dimension=2),
+        bound_account_id="acc1",
+        shared_adapter=_Adapter(),
+    )
+
+    filtered = backend._filter_known_fields(
+        {
+            "id": "rec-1",
+            "uri": "viking://resources/sample",
+            "abstract": "sample",
+            "account_id": "acc1",
+            "parent_uri": "viking://resources",
+        }
+    )
+
+    assert filtered == {
+        "id": "rec-1",
+        "uri": "viking://resources/sample",
+        "abstract": "sample",
+        "account_id": "acc1",
+    }
+
+
+@pytest.mark.asyncio
+async def test_single_account_backend_upsert_drops_legacy_parent_uri_before_write():
+    captured = {}
+
+    class _Collection:
+        def get_meta_data(self):
+            return {
+                "Fields": [
+                    {"FieldName": "id"},
+                    {"FieldName": "uri"},
+                    {"FieldName": "abstract"},
+                    {"FieldName": "active_count"},
+                    {"FieldName": "account_id"},
+                ]
+            }
+
+    class _Adapter:
+        mode = "local"
+
+        def get_collection(self):
+            return _Collection()
+
+        def upsert(self, data):
+            captured["data"] = dict(data)
+            return ["rec-legacy"]
+
+    backend = _SingleAccountBackend(
+        config=VectorDBBackendConfig(backend="local", name="context", dimension=2),
+        bound_account_id="acc1",
+        shared_adapter=_Adapter(),
+    )
+
+    record_id = await backend.upsert(
+        {
+            "id": "rec-legacy",
+            "uri": "viking://resources/sample",
+            "abstract": "sample",
+            "active_count": 2,
+            "account_id": "acc1",
+            "parent_uri": "viking://resources",
+        }
+    )
+
+    assert record_id == "rec-legacy"
+    assert captured["data"] == {
+        "id": "rec-legacy",
+        "uri": "viking://resources/sample",
+        "abstract": "sample",
+        "active_count": 2,
+        "account_id": "acc1",
+    }
