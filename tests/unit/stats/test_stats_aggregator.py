@@ -124,6 +124,28 @@ class TestStatsAggregator:
         assert result["staleness"]["oldest_memory_age_days"] >= 49
 
     @pytest.mark.asyncio
+    async def test_profile_as_root_file(self, aggregator, mock_vikingdb, mock_ctx):
+        """Profile stored as a root file (profile.md) should be detected."""
+        now = datetime.now(timezone.utc)
+        records = [
+            {
+                "uri": "viking://user/default/memories/profile.md",
+                "context_type": "memory",
+                "active_count": 1,
+                "updated_at": now.isoformat(),
+                "created_at": now.isoformat(),
+            },
+            _make_memory_record("entities", active_count=2, updated_at=now),
+        ]
+        mock_vikingdb.query = AsyncMock(return_value=records)
+
+        result = await aggregator.get_memory_stats(mock_ctx)
+
+        assert result["by_category"]["profile"] == 1
+        assert result["by_category"]["entities"] == 1
+        assert result["total_memories"] == 2
+
+    @pytest.mark.asyncio
     async def test_query_error_returns_empty(self, aggregator, mock_vikingdb, mock_ctx):
         """If VikingDB query fails, the category should show 0 records."""
         mock_vikingdb.query = AsyncMock(side_effect=Exception("connection error"))

@@ -456,6 +456,10 @@ class HierarchicalRetriever:
                     )
                     continue
 
+                # Skip archived memories from recall results.
+                if "/_archive/" in uri:
+                    continue
+
                 telemetry.count("vector.passed", 1)
                 # Deduplicate by URI and keep the highest-scored candidate.
                 previous = collected_by_uri.get(uri)

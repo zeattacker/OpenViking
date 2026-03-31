@@ -77,7 +77,7 @@ class StatsAggregator:
         for record in all_records:
             uri = record.get("uri", "")
             for cat in categories:
-                if f"/{cat}/" in uri:
+                if f"/{cat}/" in uri or uri.endswith(f"/{cat}.md"):
                     grouped[cat].append(record)
                     break
 

@@ -371,6 +371,7 @@ template: |
     "memories": [
       {
         "category": "profile|preferences|entities|events|cases|patterns|tools|skills",
+        "importance": 5,
         "abstract": "Merge types use `[Merge key]: [Description]`, independent types use specific description",
         "overview": "Structured Markdown, use different heading templates by category",
         "content": "Free Markdown, complete narrative",
@@ -387,6 +388,7 @@ template: |
   }
 
   Notes:
+  - **"importance"**: Rate 1-10 how poignant/significant this memory is. 1 = mundane (e.g., greeting, routine action). 5 = moderately useful (e.g., a preference, a fact). 10 = critical (e.g., a major decision, a breaking change, a life event). This score helps prioritize retrieval.
   - The values of "abstract", "overview", and "content" MUST be written in {{ output_language }} (if output_language is "auto", use the dominant language in recent_messages).
   - Only extract truly valuable personalized information
   - If nothing worth recording, return {"memories": []}

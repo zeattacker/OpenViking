@@ -277,13 +277,23 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 # Generate embedding vector(s)
                 if self._embedder:
                     try:
+                        # Truncate text to stay within embedding model's max sequence length.
+                        # BGE-M3 supports up to 8192 tokens; ~4 chars/token gives ~32k chars.
+                        _MAX_EMBED_CHARS = 30000
+                        embed_input = embedding_msg.message
+                        if isinstance(embed_input, str) and len(embed_input) > _MAX_EMBED_CHARS:
+                            logger.warning(
+                                f"Truncating embedding input from {len(embed_input)} to {_MAX_EMBED_CHARS} chars"
+                            )
+                            embed_input = embed_input[:_MAX_EMBED_CHARS]
+
                         # embed() is a blocking HTTP call; offload to thread pool to avoid
                         # blocking the event loop and allow real concurrency.
                         import time as _time
 
                         _embed_t0 = _time.monotonic()
                         result: EmbedResult = await asyncio.to_thread(
-                            self._embedder.embed, embedding_msg.message
+                            self._embedder.embed, embed_input
                         )
                         _embed_elapsed = _time.monotonic() - _embed_t0
                         try:

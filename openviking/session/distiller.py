@@ -353,6 +353,17 @@ class PatternDistiller:
 
         await self.viking_fs.write_file(pattern_uri, response, ctx=ctx)
 
+        # Archive original source cases after pattern creation.
+        for source_uri in cluster_uris:
+            try:
+                parts = source_uri.rsplit("/", 1)
+                archive_uri = f"{parts[0]}/_archive/{parts[1]}"
+                await self.viking_fs.mv(source_uri, archive_uri, ctx=ctx)
+            except Exception as e:
+                logger.warning(
+                    "[PatternDistiller] Failed to archive %s: %s", source_uri, e
+                )
+
         # Build context for vectorization.
         pattern_context = Context(
             uri=pattern_uri,

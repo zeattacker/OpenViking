@@ -112,7 +112,7 @@ function roughEstimate(messages: AgentMessage[]): number {
   return Math.ceil(JSON.stringify(messages).length / 4);
 }
 
-function msgTokenEstimate(msg: AgentMessage): number {
+export function msgTokenEstimate(msg: AgentMessage): number {
   const raw = (msg as Record<string, unknown>).content;
   if (typeof raw === "string") return Math.ceil(raw.length / 4);
   if (Array.isArray(raw)) return Math.ceil(JSON.stringify(raw).length / 4);
@@ -224,7 +224,7 @@ export function openClawSessionRefToOvStorageId(ref: string): string {
  * 1. The assistant message with toolUse blocks in its content array
  * 2. A separate toolResult message per ToolPart (carrying tool_output)
  */
-function convertToAgentMessages(msg: { role: string; parts: unknown[] }): AgentMessage[] {
+export function convertToAgentMessages(msg: { role: string; parts: unknown[] }): AgentMessage[] {
   const parts = msg.parts ?? [];
   const contentBlocks: Record<string, unknown>[] = [];
   const toolResults: AgentMessage[] = [];
@@ -307,7 +307,7 @@ function convertToAgentMessages(msg: { role: string; parts: unknown[] }): AgentM
   return result;
 }
 
-function normalizeAssistantContent(messages: AgentMessage[]): void {
+export function normalizeAssistantContent(messages: AgentMessage[]): void {
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
     if (msg?.role === "assistant" && typeof msg.content === "string") {
@@ -355,7 +355,7 @@ export function formatMessageFaithful(msg: OVMessage): string {
   return `${roleTag}:\n${sections.join("\n\n")}`;
 }
 
-function buildSystemPromptAddition(): string {
+export function buildSystemPromptAddition(): string {
   return [
     "## Session Context Guide",
     "",

@@ -67,6 +67,7 @@ class CandidateMemory:
     source_session: str
     user: str
     language: str = "auto"
+    importance: int = 5  # 1-10 poignancy score (Generative Agents-inspired)
 
 
 @dataclass
@@ -407,6 +408,8 @@ class MemoryExtractor:
                 else:
                     # 现有逻辑不变，前向兼容
                     with telemetry.measure("memory.extract.stage.normalize_candidates"):
+                        raw_importance = mem.get("importance", 5)
+                        importance = max(1, min(10, int(raw_importance))) if isinstance(raw_importance, (int, float)) else 5
                         candidates.append(
                             CandidateMemory(
                                 category=category,
@@ -416,6 +419,7 @@ class MemoryExtractor:
                                 source_session=session_id,
                                 user=user,
                                 language=output_language,
+                                importance=importance,
                             )
                         )
 
