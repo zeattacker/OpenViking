@@ -42,8 +42,6 @@ export type MemoryOpenVikingConfig = {
    * standard-diagnostics file writes) for assemble/afterTurn. Set false to disable.
    */
   emitStandardDiagnostics?: boolean;
-  /** When true, log tenant routing for semantic find and session writes (messages/commit) to the plugin logger. */
-  logFindRequests?: boolean;
 };
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:1933";
@@ -57,8 +55,7 @@ const DEFAULT_RECALL_SCORE_THRESHOLD = 0.15;
 const DEFAULT_RECALL_MAX_CONTENT_CHARS = 500;
 const DEFAULT_RECALL_PREFER_ABSTRACT = true;
 const DEFAULT_RECALL_TOKEN_BUDGET = 2000;
-const DEFAULT_COMMIT_TOKEN_THRESHOLD = 20000;
-const DEFAULT_EMIT_STANDARD_DIAGNOSTICS = false;
+const DEFAULT_COMMIT_TOKEN_THRESHOLD = 2000;
 const DEFAULT_INGEST_REPLY_ASSIST = true;
 const DEFAULT_INGEST_REPLY_ASSIST_MIN_SPEAKER_TURNS = 2;
 const DEFAULT_INGEST_REPLY_ASSIST_MIN_CHARS = 120;
@@ -72,6 +69,7 @@ const DEFAULT_ALIGNMENT = {
   driftAlertThreshold: 0.65,
   driftConsecutiveFlagLimit: 5,
 };
+const DEFAULT_EMIT_STANDARD_DIAGNOSTICS = false;
 const DEFAULT_LOCAL_CONFIG_PATH = join(homedir(), ".openviking", "ov.conf");
 
 const DEFAULT_AGENT_ID = "default";
@@ -104,16 +102,6 @@ function toNumber(value: unknown, fallback: number): number {
     }
   }
   return fallback;
-}
-
-/** True when env is 1 / true / yes (case-insensitive). Used for debug flags without editing plugin JSON. */
-function envFlag(name: string): boolean {
-  const v = process.env[name];
-  if (v == null || v === "") {
-    return false;
-  }
-  const t = String(v).trim().toLowerCase();
-  return t === "1" || t === "true" || t === "yes";
 }
 
 function assertAllowedKeys(value: Record<string, unknown>, allowed: string[], label: string) {
@@ -158,15 +146,14 @@ export const memoryOpenVikingConfigSchema = {
         "recallMaxContentChars",
         "recallPreferAbstract",
         "recallTokenBudget",
+        "commitTokenThreshold",
         "ingestReplyAssist",
         "ingestReplyAssistMinSpeakerTurns",
-        "commitTokenThreshold",
         "ingestReplyAssistMinChars",
         "profileInjection",
         "recallFormat",
         "alignment",
         "emitStandardDiagnostics",
-        "logFindRequests",
       ],
       "openviking config",
     );
@@ -270,10 +257,6 @@ export const memoryOpenVikingConfigSchema = {
         typeof cfg.emitStandardDiagnostics === "boolean"
           ? cfg.emitStandardDiagnostics
           : DEFAULT_EMIT_STANDARD_DIAGNOSTICS,
-      logFindRequests:
-        cfg.logFindRequests === true ||
-        envFlag("OPENVIKING_LOG_ROUTING") ||
-        envFlag("OPENVIKING_DEBUG"),
     };
   },
   uiHints: {
@@ -300,7 +283,7 @@ export const memoryOpenVikingConfigSchema = {
     agentId: {
       label: "Agent ID",
       placeholder: "auto-generated",
-      help: 'OpenViking X-OpenViking-Agent: non-default values combine with OpenClaw ctx.agentId as "<config>_<sessionAgent>" (then sanitized to [a-zA-Z0-9_-]). Use "default" to send only ctx.agentId.',
+      help: "Identifies this agent to OpenViking (sent as X-OpenViking-Agent header). Defaults to \"default\" if not set.",
     },
     apiKey: {
       label: "OpenViking API Key",
@@ -365,6 +348,12 @@ export const memoryOpenVikingConfigSchema = {
       advanced: true,
       help: "Maximum estimated tokens for auto-recall memory injection. Injection stops when budget is exhausted.",
     },
+    commitTokenThreshold: {
+      label: "Commit Token Threshold",
+      placeholder: String(DEFAULT_COMMIT_TOKEN_THRESHOLD),
+      advanced: true,
+      help: "Minimum estimated pending tokens before auto-commit triggers. Set to 0 to commit every turn.",
+    },
     ingestReplyAssist: {
       label: "Ingest Reply Assist",
       help: "When transcript-like memory ingestion is detected, add a lightweight reply instruction to reduce NO_REPLY.",
@@ -375,12 +364,6 @@ export const memoryOpenVikingConfigSchema = {
       placeholder: String(DEFAULT_INGEST_REPLY_ASSIST_MIN_SPEAKER_TURNS),
       help: "Minimum speaker-tag turns (e.g. Name:) to detect transcript-like ingest text.",
       advanced: true,
-    },
-    commitTokenThreshold: {
-      label: "Commit Token Threshold",
-      placeholder: String(DEFAULT_COMMIT_TOKEN_THRESHOLD),
-      advanced: true,
-      help: "Pending token count in a session before auto-commit triggers. Set 0 to disable auto-commit.",
     },
     ingestReplyAssistMinChars: {
       label: "Ingest Min Chars",
@@ -403,12 +386,10 @@ export const memoryOpenVikingConfigSchema = {
       help: 'Evaluate responses against constraints. Modes: observe_only (log), soft_enforce (block hard), full_enforce (block + correct).',
       advanced: true,
     },
-    logFindRequests: {
-      label: "Log find requests",
-      help:
-        "Log tenant routing: POST /api/v1/search/find (query, target_uri) and session POST .../messages + .../commit (sessionId, X-OpenViking-*). Never logs apiKey. " +
-        "Or set env OPENVIKING_LOG_ROUTING=1 or OPENVIKING_DEBUG=1 (no JSON edit). When on, local-mode OpenViking subprocess stderr is also logged at info.",
+    emitStandardDiagnostics: {
+      label: "Standard diagnostics (diag JSON lines)",
       advanced: true,
+      help: "When enabled, emit structured openviking: diag {...} lines for assemble and afterTurn. Disable to reduce log noise.",
     },
   },
 };
