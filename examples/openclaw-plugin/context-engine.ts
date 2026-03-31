@@ -1,9 +1,14 @@
 import { createHash } from "node:crypto";
 import type { OpenVikingClient, OVMessage } from "./client.js";
 import type { MemoryOpenVikingConfig } from "./config.js";
+import type { AlignmentResult } from "./alignment.js";
+import { alignmentCheck, assembleProfile } from "./alignment.js";
+import { DriftDetector } from "./drift.js";
+import { DEFAULT_MEMORY_OPENVIKING_DATA_DIR } from "./config.js";
 import {
   getCaptureDecision,
   extractNewTurnTexts,
+  extractLastAssistantText,
 } from "./text-utils.js";
 import {
   trimForLog,
@@ -453,6 +458,16 @@ async function pollPhase2ExtractionOutcome(
   }
 }
 
+// Failure backoff: exponential backoff after consecutive afterTurn failures.
+// Connection errors increment the counter; successful commits reset it.
+const MAX_CONSECUTIVE_FAILURES = 3;
+const BACKOFF_BASE_MS = 60_000;
+let _consecutiveCaptureFailures = 0;
+let _lastFailureTimestamp = 0;
+
+// Instructions sync: only write when the system prompt hash changes
+const _instructionsSyncedHash: Map<string, string> = new Map();
+
 export function createMemoryOpenVikingContextEngine(params: {
   id: string;
   name: string;
@@ -462,6 +477,7 @@ export function createMemoryOpenVikingContextEngine(params: {
   getClient: () => Promise<OpenVikingClient>;
   /** Extra args help match hook-populated routing when OpenClaw provides sessionKey / OV session id. */
   resolveAgentId: (sessionId: string, sessionKey?: string, ovSessionId?: string) => string;
+  pendingAlignmentFlags?: Map<string, AlignmentResult>;
   rememberSessionAgentId?: (ctx: {
     agentId?: string;
     sessionId?: string;
@@ -483,6 +499,16 @@ export function createMemoryOpenVikingContextEngine(params: {
   const diagEnabled = cfg.emitStandardDiagnostics;
   const diag = (stage: string, sessionId: string, data: Record<string, unknown>) =>
     emitDiag(logger, stage, sessionId, data, diagEnabled);
+
+  const driftDetector = cfg.alignment?.enabled
+    ? new DriftDetector({
+        windowSize: cfg.alignment.driftWindowSize,
+        alertThreshold: cfg.alignment.driftAlertThreshold,
+        consecutiveFlagLimit: cfg.alignment.driftConsecutiveFlagLimit,
+        dataDir: DEFAULT_MEMORY_OPENVIKING_DATA_DIR,
+        logger,
+      })
+    : null;
 
   async function doCommitOVSession(sessionId: string): Promise<boolean> {
     try {
@@ -705,6 +731,18 @@ export function createMemoryOpenVikingContextEngine(params: {
         return;
       }
 
+      // Exponential backoff after consecutive failures
+      if (_consecutiveCaptureFailures >= MAX_CONSECUTIVE_FAILURES) {
+        const backoffMs = BACKOFF_BASE_MS * Math.pow(2, _consecutiveCaptureFailures - MAX_CONSECUTIVE_FAILURES);
+        if (Date.now() - _lastFailureTimestamp < backoffMs) {
+          logger.info(
+            `openviking: afterTurn skipped (backoff after ${_consecutiveCaptureFailures} failures, ` +
+            `${Math.round((backoffMs - (Date.now() - _lastFailureTimestamp)) / 1000)}s remaining)`,
+          );
+          return;
+        }
+      }
+
       try {
         const sessionKey =
           (typeof afterTurnParams.sessionKey === "string" && afterTurnParams.sessionKey.trim()) ||
@@ -726,7 +764,36 @@ export function createMemoryOpenVikingContextEngine(params: {
           afterTurnParams.sessionId ?? sessionKey ?? OVSessionId;
         const agentId = resolveAgentId(routingRef, sessionKey, OVSessionId);
 
+        // Sync agent instructions (system prompt) to OpenViking — only when hash changes
         const messages = afterTurnParams.messages ?? [];
+        try {
+          const systemMsg = messages.find(
+            (m) => (m as Record<string, unknown>).role === "system",
+          ) as Record<string, unknown> | undefined;
+          const sysContent = typeof systemMsg?.content === "string" ? systemMsg.content : "";
+          if (sysContent.length > 20) {
+            const sysHash = createHash("md5").update(sysContent).digest("hex").slice(0, 16);
+            const syncKey = OVSessionId ?? "__global__";
+            const cached = _instructionsSyncedHash.get(syncKey);
+            if (cached !== sysHash) {
+              const syncClient = await getClient();
+              await syncClient.writeFile(
+                "viking://agent/instructions/system_prompt.md",
+                sysContent,
+              );
+              _instructionsSyncedHash.set(syncKey, sysHash);
+              logger.info(`openviking: synced agent instructions (hash=${sysHash}, len=${sysContent.length})`);
+              if (_instructionsSyncedHash.size > 200) {
+                const keys = [..._instructionsSyncedHash.keys()];
+                for (const k of keys.slice(0, keys.length - 50)) {
+                  _instructionsSyncedHash.delete(k);
+                }
+              }
+            }
+          }
+        } catch (err) {
+          logger.info(`openviking: instructions sync skipped: ${String(err)}`);
+        }
         if (messages.length === 0) {
           diag("afterTurn_skip", OVSessionId, {
             reason: "no_messages",
@@ -802,6 +869,9 @@ export function createMemoryOpenVikingContextEngine(params: {
             `task_id=${commitResult.task_id ?? "none"}${commitExtra}`,
         );
 
+        // Successful commit — reset failure backoff
+        _consecutiveCaptureFailures = 0;
+
         diag("afterTurn_commit", OVSessionId, {
           pendingTokens,
           commitTokenThreshold: cfg.commitTokenThreshold,
@@ -826,10 +896,62 @@ export function createMemoryOpenVikingContextEngine(params: {
           }
         }
       } catch (err) {
-        warnOrInfo(logger, `openviking: afterTurn failed: ${String(err)}`);
+        // Connection/server errors: increment failure counter for backoff
+        _consecutiveCaptureFailures++;
+        _lastFailureTimestamp = Date.now();
+        warnOrInfo(logger, `openviking: afterTurn failed (${_consecutiveCaptureFailures}/${MAX_CONSECUTIVE_FAILURES}): ${String(err)}`);
         diag("afterTurn_error", afterTurnParams.sessionId ?? "(unknown)", {
           error: String(err),
+          consecutiveFailures: _consecutiveCaptureFailures,
         });
+      }
+
+      // P2: Alignment evaluation (post-delivery, observe mode)
+      if (cfg.alignment?.enabled && driftDetector) {
+        try {
+          const assistantText = extractLastAssistantText(afterTurnParams.messages ?? []);
+          if (assistantText && assistantText.length > 20) {
+            const client = await getClient();
+            let instructionsText = "";
+            try {
+              instructionsText = await client.read("viking://agent/instructions/");
+            } catch {
+              // No instructions — only default constraints active
+            }
+
+            const profile = assembleProfile(instructionsText);
+            const result = alignmentCheck(assistantText, profile);
+            const alert = driftDetector.record(result);
+            const driftState = driftDetector.getState();
+
+            const responsePreview = assistantText.length > 80
+              ? `${assistantText.slice(0, 80)}...`
+              : assistantText;
+            logger.info(
+              `openviking: alignment verdict=${result.verdict} score=${result.score.toFixed(2)} ` +
+              `constraints=${profile.constraints.length} mode=${cfg.alignment.mode} ` +
+              `drift=[evaluated=${driftState.totalEvaluated},flagged=${driftState.totalFlagged},consecutive=${driftState.consecutiveFlags}] ` +
+              `response="${responsePreview}"`,
+            );
+
+            if (result.verdict !== "pass") {
+              logger.info(
+                `openviking: alignment issues: ${result.issues.map((i) => `[L${i.layer}:${i.type}] ${i.description}${i.matchedText ? ` (matched: ${i.matchedText})` : ""}`).join("; ")}`,
+              );
+              if (params.pendingAlignmentFlags) {
+                params.pendingAlignmentFlags.set(afterTurnParams.sessionId, result);
+              }
+            }
+            if (alert) {
+              warnOrInfo(
+                logger,
+                `openviking: DRIFT ALERT — mean=${alert.mean.toFixed(2)}, consecutiveFlags=${alert.consecutiveFlags}, totalEvaluated=${alert.totalEvaluated}`,
+              );
+            }
+          }
+        } catch (err) {
+          warnOrInfo(logger, `openviking: alignment check failed: ${String(err)}`);
+        }
       }
     },
 
