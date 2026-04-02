@@ -294,7 +294,8 @@ export function pickMemoriesForInjection(
   }
 
   // Budget allocation
-  const agentCategories = ["patterns", "tools", "skills"];
+  // Tools/skills are injected at session start via <tool-experience>, not per-turn recall.
+  const agentCategories = ["patterns"];
   const availableCategories = agentCategories.filter((c) => (agentByCategory.get(c)?.length ?? 0) > 0);
   const userBudget = Math.max(1, Math.floor(limit * userRatio));
   const agentBudget = limit - userBudget;

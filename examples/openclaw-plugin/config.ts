@@ -53,6 +53,16 @@ export type MemoryOpenVikingConfig = {
   phase2PollIntervalMs?: number;
   /** Phase2 memory extraction poll timeout in ms (default 120000). */
   phase2PollTimeoutMs?: number;
+  /** When true (default), aggregate tool/skill experience from all agents and inject at session start. */
+  recallToolExperience?: boolean;
+  /** When true (default), inject directory structure of available memories at session start. */
+  directoryPreInject?: boolean;
+  /** Ratio of context window at which to trigger background commit (0.1-0.9). Overrides commitTokenThreshold when set. */
+  compactThreshold1Ratio?: number;
+  /** Ratio of context window at which to force commit (0.1-0.9). Must be > compactThreshold1Ratio. */
+  compactThreshold2Ratio?: number;
+  /** Context window size in tokens (default 131072). Used with compactThreshold ratios. */
+  contextWindowSize?: number;
 };
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:1933";
@@ -200,6 +210,11 @@ export const memoryOpenVikingConfigSchema = {
         "recallUserRatio",
         "phase2PollIntervalMs",
         "phase2PollTimeoutMs",
+        "recallToolExperience",
+        "directoryPreInject",
+        "compactThreshold1Ratio",
+        "compactThreshold2Ratio",
+        "contextWindowSize",
       ],
       "openviking config",
     );
@@ -321,6 +336,13 @@ export const memoryOpenVikingConfigSchema = {
         5000,
         Math.min(600_000, Math.floor(toNumber(cfg.phase2PollTimeoutMs, DEFAULT_PHASE2_POLL_TIMEOUT_MS))),
       ),
+      recallToolExperience: cfg.recallToolExperience !== false,
+      directoryPreInject: cfg.directoryPreInject !== false,
+      compactThreshold1Ratio: typeof cfg.compactThreshold1Ratio === "number"
+        ? Math.max(0.1, Math.min(0.9, cfg.compactThreshold1Ratio)) : undefined as unknown as number,
+      compactThreshold2Ratio: typeof cfg.compactThreshold2Ratio === "number"
+        ? Math.max(0.1, Math.min(0.9, cfg.compactThreshold2Ratio)) : undefined as unknown as number,
+      contextWindowSize: Math.max(8192, Math.floor(toNumber(cfg.contextWindowSize, 131072))),
     };
   },
   uiHints: {

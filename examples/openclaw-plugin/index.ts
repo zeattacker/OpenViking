@@ -111,6 +111,147 @@ const MAX_OPENVIKING_STDERR_LINES = 200;
 const MAX_OPENVIKING_STDERR_CHARS = 256_000;
 const AUTO_RECALL_TIMEOUT_MS = 5_000;
 
+// ── Session-start injection caches ──
+type SessionCache = { text: string; ts: number; sid: string };
+let _profileCache: SessionCache | null = null;
+let _toolExpCache: SessionCache | null = null;
+let _dirCache: SessionCache | null = null;
+
+/**
+ * Aggregate tool/skill experience from all agent spaces via direct file reads.
+ * Returns formatted summary of top tools by call count.
+ */
+async function aggregateToolExperience(
+  client: OpenVikingClient,
+  agentId: string | undefined,
+  _logger?: unknown,
+): Promise<string> {
+  // Map: toolName → { calls, bestFor[], watchOut[] }
+  const toolMap = new Map<string, { calls: number; bestFor: Set<string>; watchOut: Set<string> }>();
+
+  // List all agent spaces
+  let agentSpaces: Array<Record<string, unknown>> = [];
+  try {
+    agentSpaces = await client.listDirectory("viking://agent/", agentId);
+  } catch {
+    return "";
+  }
+
+  // For each agent space, scan tools/ and skills/ directories
+  for (const space of agentSpaces) {
+    const spaceName = String(space.name ?? "");
+    if (!spaceName || spaceName.startsWith(".") || spaceName === "_archive") continue;
+
+    for (const subdir of ["memories/tools", "memories/skills"]) {
+      let files: Array<Record<string, unknown>> = [];
+      try {
+        files = await client.listDirectory(`viking://agent/${spaceName}/${subdir}/`, agentId);
+      } catch {
+        continue;
+      }
+
+      for (const file of files) {
+        const name = String(file.name ?? "");
+        // Skip run-logs, hidden files, directories, archives
+        if (!name.endsWith(".md") || name.startsWith(".") || name.startsWith("run-")) continue;
+        if (file.isDir) continue;
+
+        const uri = String(file.uri ?? `viking://agent/${spaceName}/${subdir}/${name}`);
+        try {
+          const content = await client.read(uri, agentId);
+          if (!content) continue;
+
+          const toolName = name.replace(/\.md$/, "");
+          const callsMatch = content.match(/Based on (\d+) historical (?:calls|executions)/);
+          const calls = callsMatch ? parseInt(callsMatch[1], 10) : 0;
+          const bestForMatch = content.match(/Best for:\s*(.+?)(?:\n|$)/);
+          const watchOutMatch = content.match(/Common failures:\s*(.+?)(?:\n|$)/);
+
+          const entry = toolMap.get(toolName) ?? { calls: 0, bestFor: new Set(), watchOut: new Set() };
+          entry.calls += calls;
+          if (bestForMatch?.[1]) {
+            // Take first 2 items to keep it compact
+            bestForMatch[1].split(/[;,]/).slice(0, 2).forEach((s) => {
+              const trimmed = s.trim();
+              if (trimmed) entry.bestFor.add(trimmed);
+            });
+          }
+          if (watchOutMatch?.[1]) {
+            watchOutMatch[1].split(/[;,]/).slice(0, 2).forEach((s) => {
+              const trimmed = s.trim();
+              if (trimmed) entry.watchOut.add(trimmed);
+            });
+          }
+          toolMap.set(toolName, entry);
+        } catch {
+          continue;
+        }
+      }
+    }
+  }
+
+  if (toolMap.size === 0) return "";
+
+  // Sort by calls desc, take top 5
+  const sorted = [...toolMap.entries()]
+    .filter(([, v]) => v.calls > 0)
+    .sort((a, b) => b[1].calls - a[1].calls)
+    .slice(0, 5);
+
+  if (sorted.length === 0) return "";
+
+  return sorted
+    .map(([name, info]) => {
+      const lines = [`${name}: ${info.calls} calls`];
+      if (info.bestFor.size > 0) lines.push(`  Best for: ${[...info.bestFor].slice(0, 3).join("; ")}`);
+      if (info.watchOut.size > 0) lines.push(`  Watch out: ${[...info.watchOut].slice(0, 3).join("; ")}`);
+      return lines.join("\n");
+    })
+    .join("\n");
+}
+
+/**
+ * Build compact directory listing of available memories for system prompt injection.
+ */
+async function buildDirectoryListing(
+  client: OpenVikingClient,
+  agentId: string | undefined,
+): Promise<string> {
+  const parts: string[] = [];
+
+  for (const [label, uri] of [
+    ["user/memories", "viking://user/memories/"],
+    ["agent/memories", "viking://agent/memories/"],
+  ] as const) {
+    try {
+      const entries = await client.listDirectory(uri, agentId);
+      if (!entries || entries.length === 0) continue;
+
+      const lines = entries
+        .filter((e) => {
+          const n = String(e.name ?? "");
+          return n && !n.startsWith(".") && n !== "_archive";
+        })
+        .slice(0, 50)
+        .map((e) => {
+          const name = String(e.name ?? "");
+          const suffix = e.isDir ? "/" : "";
+          const abstract = typeof e.abstract === "string" && e.abstract.trim()
+            ? ` - ${e.abstract.trim().slice(0, 80)}` : "";
+          return `  ${name}${suffix}${abstract}`;
+        });
+
+      if (lines.length > 0) {
+        parts.push(`${label}/\n${lines.join("\n")}`);
+      }
+    } catch {
+      continue;
+    }
+  }
+
+  return parts.join("\n");
+}
+
 /**
  * OpenViking `UserIdentifier` allows only [a-zA-Z0-9_-] for agent_id
  * (see openviking_cli/session/user_id.py). OpenClaw ids may contain ":"
@@ -851,6 +992,90 @@ const contextEnginePlugin = {
       }
 
       const prependContextParts: string[] = [];
+
+      // ── Feature 1: Profile Injection (session start, cached) ──
+      if (cfg.profileInjection) {
+        const PROFILE_TTL_MS = 10 * 60 * 1000;
+        const now = Date.now();
+        const sid = ctx?.sessionId ?? "";
+        if (
+          !_profileCache ||
+          _profileCache.sid !== sid ||
+          now - _profileCache.ts > PROFILE_TTL_MS
+        ) {
+          try {
+            const text = await withTimeout(
+              client.readProfile(),
+              5000,
+              "openviking: profile read timeout",
+            );
+            _profileCache = { text, ts: now, sid };
+          } catch {
+            _profileCache = { text: "", ts: now, sid };
+          }
+        }
+        if (_profileCache.text.trim()) {
+          prependContextParts.push(
+            `<user-profile>\n${_profileCache.text.trim()}\n</user-profile>`,
+          );
+        }
+      }
+
+      // ── Feature 2: Tool/Skill Experience (session start, cached) ──
+      if (cfg.recallToolExperience) {
+        const TOOL_EXP_TTL_MS = 30 * 60 * 1000;
+        const now = Date.now();
+        const sid = ctx?.sessionId ?? "";
+        if (
+          !_toolExpCache ||
+          _toolExpCache.sid !== sid ||
+          now - _toolExpCache.ts > TOOL_EXP_TTL_MS
+        ) {
+          try {
+            const text = await withTimeout(
+              aggregateToolExperience(client, agentId),
+              10000,
+              "openviking: tool experience aggregation timeout",
+            );
+            _toolExpCache = { text, ts: now, sid };
+          } catch {
+            _toolExpCache = { text: "", ts: now, sid };
+          }
+        }
+        if (_toolExpCache.text.trim()) {
+          prependContextParts.push(
+            `<tool-experience>\n${_toolExpCache.text.trim()}\n</tool-experience>`,
+          );
+        }
+      }
+
+      // ── Feature 3: Directory Structure Pre-inject (session start, cached) ──
+      if (cfg.directoryPreInject) {
+        const DIR_TTL_MS = 30 * 60 * 1000;
+        const now = Date.now();
+        const sid = ctx?.sessionId ?? "";
+        if (
+          !_dirCache ||
+          _dirCache.sid !== sid ||
+          now - _dirCache.ts > DIR_TTL_MS
+        ) {
+          try {
+            const text = await withTimeout(
+              buildDirectoryListing(client, agentId),
+              5000,
+              "openviking: directory listing timeout",
+            );
+            _dirCache = { text, ts: now, sid };
+          } catch {
+            _dirCache = { text: "", ts: now, sid };
+          }
+        }
+        if (_dirCache.text.trim()) {
+          prependContextParts.push(
+            `<available-memories>\n${_dirCache.text.trim()}\n</available-memories>`,
+          );
+        }
+      }
 
       if (cfg.autoRecall && queryText.length >= 5) {
         const precheck = await quickRecallPrecheck(cfg.mode, cfg.baseUrl, cfg.port, localProcess);

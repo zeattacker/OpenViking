@@ -463,6 +463,7 @@ const MAX_CONSECUTIVE_FAILURES = 3;
 const BACKOFF_BASE_MS = 60_000;
 let _consecutiveCaptureFailures = 0;
 let _lastFailureTimestamp = 0;
+let _backgroundCommitState: { ovSessionId: string; taskId: string; startedAt: number } | null = null;
 
 // Instructions sync: only write when the system prompt hash changes
 const _instructionsSyncedHash: Map<string, string> = new Map();
@@ -849,52 +850,90 @@ export function createMemoryOpenVikingContextEngine(params: {
         const session = await client.getSession(OVSessionId, agentId);
         const pendingTokens = session.pending_tokens ?? 0;
 
-        if (pendingTokens < cfg.commitTokenThreshold) {
+        // ── Dual-threshold compact (Feature 4) ──
+        // If compactThreshold1Ratio is configured, use dual-threshold mode.
+        // Otherwise fall back to legacy single commitTokenThreshold.
+        const useDualThreshold = typeof cfg.compactThreshold1Ratio === "number";
+        const threshold1 = useDualThreshold
+          ? Math.floor((cfg.contextWindowSize ?? 131072) * cfg.compactThreshold1Ratio!)
+          : cfg.commitTokenThreshold;
+        const threshold2 = useDualThreshold && typeof cfg.compactThreshold2Ratio === "number"
+          ? Math.floor((cfg.contextWindowSize ?? 131072) * cfg.compactThreshold2Ratio!)
+          : Infinity;
+
+        if (useDualThreshold && pendingTokens >= threshold2) {
+          // Threshold 2: force commit, block until done
+          logger.info(
+            `openviking: threshold2 hit (${pendingTokens} >= ${threshold2}), forcing synchronous commit`,
+          );
+          const commitResult = await client.commitSession(OVSessionId, { wait: true, agentId });
+          _backgroundCommitState = null;
+          _consecutiveCaptureFailures = 0;
+          diag("afterTurn_commit", OVSessionId, {
+            pendingTokens,
+            threshold: "threshold2_force",
+            threshold2,
+            status: commitResult.status,
+            archived: commitResult.archived ?? false,
+            taskId: commitResult.task_id ?? null,
+          });
+          if (commitResult.task_id && cfg.logFindRequests) {
+            void pollPhase2ExtractionOutcome(
+              getClient, commitResult.task_id, agentId, logger, OVSessionId,
+              cfg.phase2PollIntervalMs, cfg.phase2PollTimeoutMs,
+            );
+          }
+        } else if (pendingTokens >= threshold1 && !_backgroundCommitState) {
+          // Threshold 1 (or legacy single threshold): background commit
+          const commitResult = await client.commitSession(OVSessionId, { wait: false, agentId });
+          const commitExtra = cfg.logFindRequests
+            ? ` ${toJsonLog({ captured: [trimForLog(turnText, 260)] })}`
+            : "";
+          logger.info(
+            `openviking: committed session=${OVSessionId}, ` +
+              `status=${commitResult.status}, archived=${commitResult.archived ?? false}, ` +
+              `task_id=${commitResult.task_id ?? "none"}` +
+              (useDualThreshold ? ` (threshold1=${threshold1})` : "") +
+              commitExtra,
+          );
+
+          if (useDualThreshold && commitResult.task_id) {
+            _backgroundCommitState = {
+              ovSessionId: OVSessionId,
+              taskId: commitResult.task_id,
+              startedAt: Date.now(),
+            };
+          }
+
+          _consecutiveCaptureFailures = 0;
+
+          diag("afterTurn_commit", OVSessionId, {
+            pendingTokens,
+            threshold: useDualThreshold ? "threshold1_background" : "legacy",
+            commitTokenThreshold: useDualThreshold ? threshold1 : cfg.commitTokenThreshold,
+            status: commitResult.status,
+            archived: commitResult.archived ?? false,
+            taskId: commitResult.task_id ?? null,
+            extractedMemories: (commitResult as any).extracted_memories ?? null,
+          });
+          if (commitResult.task_id && cfg.logFindRequests) {
+            logger.info(
+              `openviking: Phase2 memory extraction runs asynchronously on the server (task_id=${commitResult.task_id}). ` +
+                "memories_extracted appears only after that task completes — not in this immediate response.",
+            );
+            void pollPhase2ExtractionOutcome(
+              getClient, commitResult.task_id, agentId, logger, OVSessionId,
+              cfg.phase2PollIntervalMs, cfg.phase2PollTimeoutMs,
+            );
+          }
+        } else {
           diag("afterTurn_skip", OVSessionId, {
             reason: "below_threshold",
             pendingTokens,
-            commitTokenThreshold: cfg.commitTokenThreshold,
+            threshold: useDualThreshold ? threshold1 : cfg.commitTokenThreshold,
+            backgroundCommitActive: !!_backgroundCommitState,
           });
           return;
-        }
-
-        const commitResult = await client.commitSession(OVSessionId, { wait: false, agentId });
-        const commitExtra = cfg.logFindRequests
-          ? ` ${toJsonLog({ captured: [trimForLog(turnText, 260)] })}`
-          : "";
-        logger.info(
-          `openviking: committed session=${OVSessionId}, ` +
-            `status=${commitResult.status}, archived=${commitResult.archived ?? false}, ` +
-            `task_id=${commitResult.task_id ?? "none"}${commitExtra}`,
-        );
-
-        // Successful commit — reset failure backoff
-        _consecutiveCaptureFailures = 0;
-
-        diag("afterTurn_commit", OVSessionId, {
-          pendingTokens,
-          commitTokenThreshold: cfg.commitTokenThreshold,
-          status: commitResult.status,
-          archived: commitResult.archived ?? false,
-          taskId: commitResult.task_id ?? null,
-          extractedMemories: (commitResult as any).extracted_memories ?? null,
-        });
-        if (commitResult.task_id && cfg.logFindRequests) {
-          logger.info(
-            `openviking: Phase2 memory extraction runs asynchronously on the server (task_id=${commitResult.task_id}). ` +
-              "memories_extracted appears only after that task completes — not in this immediate response.",
-          );
-          if (cfg.logFindRequests) {
-            void pollPhase2ExtractionOutcome(
-              getClient,
-              commitResult.task_id,
-              agentId,
-              logger,
-              OVSessionId,
-              cfg.phase2PollIntervalMs,
-              cfg.phase2PollTimeoutMs,
-            );
-          }
         }
       } catch (err) {
         // Connection/server errors: increment failure counter for backoff

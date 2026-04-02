@@ -237,6 +237,10 @@ export class OpenVikingClient {
     await this.request<{ status: string }>("/health");
   }
 
+  async listDirectory(uri: string, agentId?: string): Promise<Array<Record<string, unknown>>> {
+    return this.ls(uri, agentId);
+  }
+
   private async ls(uri: string, agentId?: string): Promise<Array<Record<string, unknown>>> {
     return this.request<Array<Record<string, unknown>>>(
       `/api/v1/fs/ls?uri=${encodeURIComponent(uri)}&output=original`,
