@@ -359,7 +359,7 @@ export class OpenVikingClient {
     const effectiveAgentId = agentId ?? this.defaultAgentId;
     const identity = await this.getRuntimeIdentity(agentId);
     this.routingDebugLog?.(
-      `openviking: find POST ${this.baseUrl}/api/v1/search/find ` +
+      `openviking: find POST ${this.baseUrl}/api/v1/search/search ` +
         JSON.stringify({
           X_OpenViking_Agent: effectiveAgentId,
           X_OpenViking_Account: this.accountId.trim() || "default",
@@ -375,7 +375,7 @@ export class OpenVikingClient {
           score_threshold: body.score_threshold ?? null,
         }),
     );
-    return this.request<FindResult>("/api/v1/search/find", {
+    return this.request<FindResult>("/api/v1/search/search", {
       method: "POST",
       body: JSON.stringify(body),
     }, agentId);

@@ -270,9 +270,11 @@ class LockManager:
         if not uri:
             return
 
+        from openviking.core.directories import get_context_type_for_uri
+
         msg = SemanticMsg(
             uri=uri,
-            context_type=params.get("context_type", "resource"),
+            context_type=params.get("context_type") or get_context_type_for_uri(uri),
             account_id=params.get("account_id", "default"),
             user_id=params.get("user_id", "default"),
             agent_id=params.get("agent_id", "default"),

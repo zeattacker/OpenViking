@@ -408,9 +408,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-const PHASE2_POLL_INTERVAL_MS = 800;
-const PHASE2_POLL_MAX_MS = 120_000;
-
 /**
  * After wait=false commit, Phase2 runs on the server. Poll task until completed/failed/timeout
  * so logs show memories_extracted (otherwise it looks like "nothing was saved").
@@ -421,12 +418,14 @@ async function pollPhase2ExtractionOutcome(
   agentId: string,
   logger: Logger,
   sessionLabel: string,
+  pollIntervalMs: number = 800,
+  pollTimeoutMs: number = 120_000,
 ): Promise<void> {
-  const deadline = Date.now() + PHASE2_POLL_MAX_MS;
+  const deadline = Date.now() + pollTimeoutMs;
   try {
     const client = await getClient();
     while (Date.now() < deadline) {
-      await sleep(PHASE2_POLL_INTERVAL_MS);
+      await sleep(pollIntervalMs);
       const task = await client.getTask(taskId, agentId).catch((e) => {
         logger.warn(`openviking: phase2 getTask failed task_id=${taskId}: ${String(e)}`);
         return null;
@@ -450,7 +449,7 @@ async function pollPhase2ExtractionOutcome(
       }
     }
     logger.warn(
-      `openviking: phase2 poll timeout (${PHASE2_POLL_MAX_MS / 1000}s) task_id=${taskId} session=${sessionLabel} — ` +
+      `openviking: phase2 poll timeout (${pollTimeoutMs / 1000}s) task_id=${taskId} session=${sessionLabel} — ` +
         `check GET /api/v1/tasks/${taskId}`,
     );
   } catch (e) {
@@ -892,6 +891,8 @@ export function createMemoryOpenVikingContextEngine(params: {
               agentId,
               logger,
               OVSessionId,
+              cfg.phase2PollIntervalMs,
+              cfg.phase2PollTimeoutMs,
             );
           }
         }

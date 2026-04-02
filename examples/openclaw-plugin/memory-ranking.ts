@@ -128,6 +128,10 @@ export function summarizeExtractedMemories(
   });
 }
 
+function isConsolidatedPattern(item: FindResultItem): boolean {
+  return item.uri.includes("/patterns/consolidated_");
+}
+
 function isPreferencesMemory(item: FindResultItem): boolean {
   return (
     item.category === "preferences" ||
@@ -209,7 +213,8 @@ function lexicalOverlapBoost(tokens: string[], text: string): number {
 
 function rankForInjection(item: FindResultItem, query: RecallQueryProfile): number {
   // Keep ranking simple and stable: semantic score + light query-aware boosts.
-  const baseScore = clampScore(item.score);
+  // Scale base score higher to preserve retriever ranking when boosts are similar.
+  const baseScore = clampScore(item.score) * 3;
   const abstract = (item.abstract ?? item.overview ?? "").trim();
   const leafBoost = isLeafLikeMemory(item) ? 0.12 : 0;
   const eventBoost = query.wantsTemporal && isEventMemory(item) ? 0.1 : 0;
@@ -218,15 +223,25 @@ function rankForInjection(item: FindResultItem, query: RecallQueryProfile): numb
   return baseScore + leafBoost + eventBoost + preferenceBoost + overlapBoost;
 }
 
-export function pickMemoriesForInjection(
-  items: FindResultItem[],
-  limit: number,
-  queryText: string,
-): FindResultItem[] {
-  if (items.length === 0 || limit <= 0) {
-    return [];
+/**
+ * Detect the agent-space category of a memory item from its URI.
+ * Returns null for user-space items.
+ */
+function getAgentCategory(item: FindResultItem): string | null {
+  const uri = item.uri;
+  if (!uri.includes("viking://agent/")) {
+    return null;
   }
+  if (uri.includes("/patterns/") || uri.includes("/cases/")) return "patterns";
+  if (uri.includes("/tools/")) return "tools";
+  if (uri.includes("/skills/")) return "skills";
+  return "other";
+}
 
+/**
+ * Deduplicate and rank a list of items using the injection ranker.
+ */
+function dedupeAndRank(items: FindResultItem[], queryText: string): FindResultItem[] {
   const query = buildRecallQueryProfile(queryText);
   const sorted = [...items].sort((a, b) => rankForInjection(b, query) - rankForInjection(a, query));
   const deduped: FindResultItem[] = [];
@@ -234,27 +249,108 @@ export function pickMemoriesForInjection(
   for (const item of sorted) {
     const abstractKey = (item.abstract ?? item.overview ?? "").trim().toLowerCase();
     const key = abstractKey || item.uri;
-    if (seen.has(key)) {
-      continue;
-    }
+    if (seen.has(key)) continue;
     seen.add(key);
     deduped.push(item);
   }
-  const leaves = deduped.filter((item) => isLeafLikeMemory(item));
-  if (leaves.length >= limit) {
-    return leaves.slice(0, limit);
+  return deduped;
+}
+
+/**
+ * Multi-slot recall: allocate budget between user-space (search-ranked) and
+ * agent-space (category-coverage) memories.
+ *
+ * Agent-space categories (patterns, tools, skills) each get at least 1 slot
+ * when available.  Unused agent slots backfill to user-space.
+ */
+export function pickMemoriesForInjection(
+  items: FindResultItem[],
+  limit: number,
+  queryText: string,
+  userRatio = 0.6,
+): FindResultItem[] {
+  if (items.length === 0 || limit <= 0) {
+    return [];
   }
 
-  const picked = [...leaves];
-  const used = new Set(leaves.map((item) => item.uri));
-  for (const item of deduped) {
-    if (picked.length >= limit) {
-      break;
-    }
-    if (used.has(item.uri)) {
-      continue;
-    }
-    picked.push(item);
+  // Exclude consolidated patterns (experimental, meta-knowledge not factual)
+  const eligible = items.filter((item) => !isConsolidatedPattern(item));
+  if (eligible.length === 0) {
+    return [];
   }
-  return picked;
+
+  // Split by space
+  const userItems: FindResultItem[] = [];
+  const agentByCategory = new Map<string, FindResultItem[]>();
+  for (const item of eligible) {
+    const cat = getAgentCategory(item);
+    if (cat === null) {
+      userItems.push(item);
+    } else {
+      const list = agentByCategory.get(cat) ?? [];
+      list.push(item);
+      agentByCategory.set(cat, list);
+    }
+  }
+
+  // Budget allocation
+  const agentCategories = ["patterns", "tools", "skills"];
+  const availableCategories = agentCategories.filter((c) => (agentByCategory.get(c)?.length ?? 0) > 0);
+  const userBudget = Math.max(1, Math.floor(limit * userRatio));
+  const agentBudget = limit - userBudget;
+
+  // Each available agent category gets at least 1 slot; remainder distributed by rank
+  const perCategoryMin = availableCategories.length > 0 ? Math.max(1, Math.floor(agentBudget / availableCategories.length)) : 0;
+
+  // Pick user-space (search-ranked)
+  const rankedUser = dedupeAndRank(userItems, queryText);
+  const pickedUser = rankedUser.filter((i) => isLeafLikeMemory(i)).slice(0, userBudget);
+  // Backfill with non-leaf if needed
+  if (pickedUser.length < userBudget) {
+    const usedUris = new Set(pickedUser.map((i) => i.uri));
+    for (const item of rankedUser) {
+      if (pickedUser.length >= userBudget) break;
+      if (usedUris.has(item.uri)) continue;
+      pickedUser.push(item);
+      usedUris.add(item.uri);
+    }
+  }
+
+  // Pick agent-space (category-coverage)
+  const pickedAgent: FindResultItem[] = [];
+  for (const cat of availableCategories) {
+    const catItems = agentByCategory.get(cat) ?? [];
+    const ranked = dedupeAndRank(catItems, queryText);
+    const catSlots = Math.min(perCategoryMin, ranked.length);
+    for (let i = 0; i < catSlots; i++) {
+      pickedAgent.push(ranked[i]);
+    }
+  }
+
+  // Backfill unused agent slots to user-space or remaining agent items
+  const totalPicked = pickedUser.length + pickedAgent.length;
+  if (totalPicked < limit) {
+    const usedUris = new Set([...pickedUser, ...pickedAgent].map((i) => i.uri));
+    // First backfill from remaining user items
+    for (const item of rankedUser) {
+      if (pickedUser.length + pickedAgent.length >= limit) break;
+      if (usedUris.has(item.uri)) continue;
+      pickedUser.push(item);
+      usedUris.add(item.uri);
+    }
+    // Then from remaining agent items (e.g. "other" category)
+    const allAgentRanked = dedupeAndRank(
+      [...agentByCategory.values()].flat(),
+      queryText,
+    );
+    for (const item of allAgentRanked) {
+      if (pickedUser.length + pickedAgent.length >= limit) break;
+      if (usedUris.has(item.uri)) continue;
+      pickedAgent.push(item);
+      usedUris.add(item.uri);
+    }
+  }
+
+  // Merge: user first, then agent (preserves priority ordering)
+  return [...pickedUser, ...pickedAgent].slice(0, limit);
 }

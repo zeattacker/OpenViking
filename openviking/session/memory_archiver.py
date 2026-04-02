@@ -200,7 +200,9 @@ class MemoryArchiver:
         """Archive the given candidates.
 
         Moves each candidate to ``{parent}/_archive/{filename}`` using
-        ``viking_fs.mv()``, which atomically updates the vector index.
+        ``viking_fs.mv()``.  After moving, deletes the vector records
+        for the archived URI so stale data does not consume vector DB
+        space or appear in scoring.
 
         Args:
             candidates: Output of ``scan()``.
@@ -225,6 +227,17 @@ class MemoryArchiver:
 
             try:
                 await self.viking_fs.mv(candidate.uri, archive_uri, ctx=ctx)
+                # Delete vectors for the archived URI so they don't pollute
+                # the vector DB.  The mv() already updated URIs to _archive/
+                # paths — remove those entries entirely.
+                try:
+                    await self.storage.delete_uris(ctx, [archive_uri])
+                except Exception as e:
+                    logger.warning(
+                        "[MemoryArchiver] Failed to delete vectors for archived %s: %s",
+                        archive_uri,
+                        e,
+                    )
                 result.archived += 1
                 logger.info(
                     f"[MemoryArchiver] Archived {candidate.uri} "

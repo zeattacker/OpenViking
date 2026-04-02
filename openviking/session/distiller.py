@@ -34,6 +34,8 @@ class ConsolidationResult:
     scanned: int = 0
     clusters_found: int = 0
     patterns_created: int = 0
+    skipped_duplicates: int = 0
+    skipped_stale: int = 0
     errors: int = 0
     pattern_uris: List[str] = field(default_factory=list)
 
@@ -41,17 +43,28 @@ class ConsolidationResult:
 class PatternDistiller:
     """Consolidates similar case memories into reusable patterns."""
 
+    # Threshold for considering a new pattern a duplicate of an existing one.
+    PATTERN_DEDUP_THRESHOLD = 0.90
+
     def __init__(
         self,
         vikingdb: VikingDBManager,
         viking_fs: Any,
         similarity_threshold: float = 0.85,
         min_cluster_size: int = 3,
+        pattern_dedup_threshold: Optional[float] = None,
     ):
         self.vikingdb = vikingdb
         self.viking_fs = viking_fs
         self.similarity_threshold = similarity_threshold
         self.min_cluster_size = min_cluster_size
+        self.pattern_dedup_threshold = (
+            pattern_dedup_threshold
+            if pattern_dedup_threshold is not None
+            else self.PATTERN_DEDUP_THRESHOLD
+        )
+        config = get_openviking_config()
+        self._embedder = config.embedding.get_embedder()
 
     async def consolidate(
         self,
@@ -145,8 +158,8 @@ class PatternDistiller:
 
         result.scanned = len(md_entries)
 
-        # Step 2: Get vectors for cases from vector DB.
-        vectors = await self._get_case_vectors(cases_uri, ctx)
+        # Step 2: Get vectors for cases from vector DB, filtering stale entries.
+        vectors = await self._get_case_vectors(cases_uri, ctx, md_entries)
         if len(vectors) < self.min_cluster_size:
             logger.debug(
                 "[PatternDistiller] Not enough vectors (%d) for clustering in %s",
@@ -179,6 +192,9 @@ class PatternDistiller:
                 if pattern_uri:
                     result.patterns_created += 1
                     result.pattern_uris.append(pattern_uri)
+                elif not dry_run:
+                    # None return without dry_run means dedup skip or hash collision.
+                    result.skipped_duplicates += 1
             except Exception as e:
                 logger.error(
                     "[PatternDistiller] Failed to consolidate cluster: %s", e, exc_info=True
@@ -187,10 +203,11 @@ class PatternDistiller:
 
         logger.info(
             "[PatternDistiller] Consolidation complete for %s: "
-            "clusters=%d, patterns_created=%d, errors=%d",
+            "clusters=%d, patterns_created=%d, skipped_dup=%d, errors=%d",
             scope_uri,
             result.clusters_found,
             result.patterns_created,
+            result.skipped_duplicates,
             result.errors,
         )
         return result
@@ -199,6 +216,7 @@ class PatternDistiller:
         self,
         cases_uri_prefix: str,
         ctx: RequestContext,
+        fs_entries: Optional[List[Dict]] = None,
     ) -> List[Tuple[str, List[float], str]]:
         """Fetch (uri, vector, abstract) tuples for case memories.
 
@@ -206,8 +224,21 @@ class PatternDistiller:
         Skips chunk URIs (``#chunk_NNNN``) to avoid inflating cluster counts —
         only the parent file URI is kept.  When a file has multiple chunks,
         the first chunk's vector is used as the representative.
+
+        If *fs_entries* is provided, vectors whose parent URI does not correspond
+        to an existing filesystem entry are silently dropped.  This prevents
+        stale vectors from already-archived cases from being included.
         """
         from openviking.storage.expr import And
+
+        # Build a set of known filesystem URIs for fast membership checks.
+        known_fs_uris: Optional[set] = None
+        if fs_entries:
+            known_fs_uris = set()
+            for e in fs_entries:
+                name = e.get("name", "")
+                if name:
+                    known_fs_uris.add(f"{cases_uri_prefix}{name}")
 
         seen_parents: Dict[str, bool] = {}
         vectors: List[Tuple[str, List[float], str]] = []
@@ -235,6 +266,14 @@ class PatternDistiller:
                 if parent_uri in seen_parents:
                     continue
                 seen_parents[parent_uri] = True
+
+                # Skip stale vectors whose files no longer exist on filesystem.
+                if known_fs_uris is not None and parent_uri not in known_fs_uris:
+                    logger.debug(
+                        "[PatternDistiller] Skipping stale vector %s (file gone)",
+                        parent_uri,
+                    )
+                    continue
 
                 vec = record.get("vector")
                 if not vec or not isinstance(vec, list):
@@ -347,22 +386,42 @@ class PatternDistiller:
             logger.warning("[PatternDistiller] Empty LLM response for consolidation")
             return None
 
+        # --- Dedup check: skip if existing pattern is semantically equivalent ---
+        existing_match = await self._find_duplicate_pattern(response, scope_uri, ctx)
+        if existing_match:
+            logger.info(
+                "[PatternDistiller] Skipping duplicate pattern (matches %s), "
+                "archiving %d source cases",
+                existing_match,
+                len(cluster_uris),
+            )
+            # Still archive source cases — they are covered by the existing pattern.
+            await self._archive_source_cases(cluster_uris, ctx)
+            return None  # Caller increments skipped_duplicates via sentinel
+
         # Write pattern file.
         content_hash = hashlib.md5(response.encode()).hexdigest()[:12]
         pattern_uri = f"{scope_uri}/memories/patterns/consolidated_{content_hash}.md"
 
+        # Guard against overwriting an existing file with the same hash.
+        try:
+            existing = await self.viking_fs.read_file(pattern_uri, ctx=ctx)
+            if existing:
+                logger.info(
+                    "[PatternDistiller] Pattern file %s already exists (hash collision), "
+                    "archiving %d source cases",
+                    pattern_uri,
+                    len(cluster_uris),
+                )
+                await self._archive_source_cases(cluster_uris, ctx)
+                return None
+        except Exception:
+            pass  # File doesn't exist — proceed to write.
+
         await self.viking_fs.write_file(pattern_uri, response, ctx=ctx)
 
         # Archive original source cases after pattern creation.
-        for source_uri in cluster_uris:
-            try:
-                parts = source_uri.rsplit("/", 1)
-                archive_uri = f"{parts[0]}/_archive/{parts[1]}"
-                await self.viking_fs.mv(source_uri, archive_uri, ctx=ctx)
-            except Exception as e:
-                logger.warning(
-                    "[PatternDistiller] Failed to archive %s: %s", source_uri, e
-                )
+        await self._archive_source_cases(cluster_uris, ctx)
 
         # Build context for vectorization.
         pattern_context = Context(
@@ -410,3 +469,86 @@ class PatternDistiller:
             len(cluster_uris),
         )
         return pattern_uri
+
+    async def _find_duplicate_pattern(
+        self,
+        content: str,
+        scope_uri: str,
+        ctx: RequestContext,
+    ) -> Optional[str]:
+        """Check if *content* is semantically duplicate of an existing pattern.
+
+        Embeds the candidate content, searches the patterns/ directory via vector
+        similarity, and returns the URI of the first match above
+        ``self.pattern_dedup_threshold``.  Returns ``None`` if no duplicate found
+        or if the embedder is unavailable.
+        """
+        if not self._embedder:
+            return None
+
+        try:
+            embed_result = self._embedder.embed(content, is_query=True)
+            query_vector = embed_result.dense_vector
+            if not query_vector:
+                return None
+        except Exception as e:
+            logger.warning("[PatternDistiller] Failed to embed candidate pattern: %s", e)
+            return None
+
+        patterns_uri_prefix = f"{scope_uri}/memories/patterns/"
+
+        # Derive owner_space from scope_uri for the search filter.
+        # scope_uri is e.g. "viking://agent/{space}" or "viking://user/{space}".
+        owner_space: Optional[str] = None
+        parts = scope_uri.rstrip("/").rsplit("/", 1)
+        if len(parts) == 2:
+            owner_space = parts[1]
+
+        try:
+            results = await self.vikingdb.search_similar_memories(
+                owner_space=owner_space,
+                category_uri_prefix=patterns_uri_prefix,
+                query_vector=query_vector,
+                limit=3,
+                ctx=ctx,
+            )
+        except Exception as e:
+            logger.warning("[PatternDistiller] Pattern dedup search failed: %s", e)
+            return None
+
+        for result in results:
+            score = float(result.get("_score", result.get("score", 0)) or 0)
+            uri = result.get("uri", "")
+            if score >= self.pattern_dedup_threshold and uri.startswith(patterns_uri_prefix):
+                logger.debug(
+                    "[PatternDistiller] Duplicate pattern match: %s (score=%.4f)",
+                    uri,
+                    score,
+                )
+                return uri
+
+        return None
+
+    async def _archive_source_cases(
+        self,
+        cluster_uris: List[str],
+        ctx: RequestContext,
+    ) -> None:
+        """Move source case files to ``_archive/`` subdirectory and remove vectors."""
+        for source_uri in cluster_uris:
+            try:
+                parts = source_uri.rsplit("/", 1)
+                archive_uri = f"{parts[0]}/_archive/{parts[1]}"
+                await self.viking_fs.mv(source_uri, archive_uri, ctx=ctx)
+                # Remove vectors for archived source — they are superseded by
+                # the consolidated pattern and should not consume vector DB space.
+                try:
+                    await self.vikingdb.delete_uris(ctx, [archive_uri])
+                except Exception as e:
+                    logger.debug(
+                        "[PatternDistiller] Vector cleanup for %s: %s", archive_uri, e
+                    )
+            except Exception as e:
+                logger.warning(
+                    "[PatternDistiller] Failed to archive %s: %s", source_uri, e
+                )

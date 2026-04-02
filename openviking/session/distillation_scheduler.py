@@ -70,6 +70,15 @@ class DistillationScheduler:
                 distill_cfg.semantic_regen_hour_utc,
             )
 
+        if distill_cfg.archive_gc_enabled:
+            self._tasks.append(asyncio.create_task(self._archive_gc_loop()))
+            logger.info(
+                "[DistillationScheduler] Archive GC loop started "
+                "(interval=%dh, max_age=%dd)",
+                distill_cfg.archive_gc_interval_hours,
+                distill_cfg.archive_gc_max_age_days,
+            )
+
     async def stop(self) -> None:
         """Stop all background loops."""
         if not self._running:
@@ -336,6 +345,95 @@ class DistillationScheduler:
                 logger.info(
                     "[DistillationScheduler] Enqueued full semantic regen for %s",
                     dir_uri,
+                )
+
+    async def _archive_gc_loop(self) -> None:
+        """Periodically delete old archived files to reclaim storage."""
+        from openviking.storage.viking_fs import get_viking_fs
+        from openviking.utils.time_utils import parse_iso_datetime
+
+        distill_cfg = self._config.distillation
+        interval_secs = distill_cfg.archive_gc_interval_hours * 3600
+        max_age_days = distill_cfg.archive_gc_max_age_days
+        first_run = True
+
+        while self._running:
+            if first_run:
+                first_run = False
+                await asyncio.sleep(120)
+            else:
+                try:
+                    await asyncio.sleep(interval_secs)
+                except asyncio.CancelledError:
+                    break
+
+            if not self._running:
+                break
+
+            try:
+                viking_fs = get_viking_fs()
+                if not viking_fs:
+                    continue
+
+                now = datetime.now(timezone.utc)
+                cutoff = now - timedelta(days=max_age_days)
+                total_deleted = 0
+
+                scopes = await self._get_user_scopes()
+                for scope in scopes:
+                    ctx = self._make_ctx()
+                    # Scan _archive dirs under each memory subdirectory and episodes
+                    archive_dirs = [
+                        f"{scope}/memories/entities/_archive",
+                        f"{scope}/memories/events/_archive",
+                        f"{scope}/memories/cases/_archive",
+                        f"{scope}/memories/patterns/_archive",
+                        f"{scope}/memories/preferences/_archive",
+                        f"{scope}/episodes/_archive",
+                    ]
+                    for archive_dir in archive_dirs:
+                        try:
+                            entries = await viking_fs.ls(archive_dir, ctx=ctx)
+                        except Exception:
+                            continue
+
+                        for entry in entries:
+                            if not isinstance(entry, dict):
+                                continue
+                            name = entry.get("name", "")
+                            if not name or name.startswith(".") or entry.get("isDir"):
+                                continue
+
+                            mod_time_raw = entry.get("modTime", "")
+                            if not mod_time_raw:
+                                continue
+
+                            try:
+                                mod_time = parse_iso_datetime(mod_time_raw)
+                            except Exception:
+                                continue
+
+                            if mod_time < cutoff:
+                                file_uri = entry.get("uri") or f"{archive_dir}/{name}"
+                                try:
+                                    await viking_fs.rm(file_uri, ctx=ctx)
+                                    total_deleted += 1
+                                except Exception as e:
+                                    logger.warning(
+                                        "[DistillationScheduler] Archive GC failed to delete %s: %s",
+                                        file_uri,
+                                        e,
+                                    )
+
+                if total_deleted > 0:
+                    logger.info(
+                        "[DistillationScheduler] Archive GC deleted %d old files (max_age=%dd)",
+                        total_deleted,
+                        max_age_days,
+                    )
+            except Exception as e:
+                logger.error(
+                    "[DistillationScheduler] Archive GC error: %s", e, exc_info=True
                 )
 
     def _make_ctx(self) -> RequestContext:

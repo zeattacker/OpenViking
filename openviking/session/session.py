@@ -443,7 +443,7 @@ class Session:
         tracker = get_task_tracker()
         task = tracker.create("session_commit", resource_id=self.session_id)
 
-        asyncio.create_task(
+        _extraction_task = asyncio.create_task(
             self._run_memory_extraction(
                 task_id=task.task_id,
                 archive_uri=archive_uri,
@@ -451,6 +451,11 @@ class Session:
                 usage_records=usage_snapshot,
                 first_message_id=first_message_id,
                 last_message_id=last_message_id,
+            )
+        )
+        _extraction_task.add_done_callback(
+            lambda t: t.exception() and logger.error(
+                "Memory extraction task failed: %s", t.exception(), exc_info=t.exception()
             )
         )
 

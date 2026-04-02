@@ -56,14 +56,10 @@ class Summarizer:
 
         telemetry = get_current_telemetry()
         for uri, temp_uri in zip(resource_uris, temp_uris):
-            # Determine context_type based on URI path segments.
-            # Memory URIs: viking://user/{space}/memories/*, viking://agent/{id}/memories/*
-            # Skill URIs:  viking://agent/skills/*, viking://agent/{id}/skills/*
-            context_type = "resource"
-            if "/memories/" in uri:
-                context_type = "memory"
-            elif "/skills/" in uri:
-                context_type = "skill"
+            # Determine context_type using centralized inference.
+            from openviking.core.directories import get_context_type_for_uri
+
+            context_type = get_context_type_for_uri(uri)
 
             msg = SemanticMsg(
                 uri=temp_uri,

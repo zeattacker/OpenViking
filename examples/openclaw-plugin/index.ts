@@ -889,12 +889,14 @@ const contextEnginePlugin = {
                 const uniqueMemories = allMemories.filter((memory, index, self) =>
                   index === self.findIndex((m) => m.uri === memory.uri)
                 );
-                const leafOnly = uniqueMemories.filter((m) => m.level === 2);
-                const processed = postProcessMemories(leafOnly, {
+                const filtered = cfg.recallMultiTier
+                  ? uniqueMemories
+                  : uniqueMemories.filter((m) => m.level === 2);
+                const processed = postProcessMemories(filtered, {
                   limit: candidateLimit,
                   scoreThreshold: cfg.recallScoreThreshold,
                 });
-                const memories = pickMemoriesForInjection(processed, cfg.recallLimit, queryText);
+                const memories = pickMemoriesForInjection(processed, cfg.recallLimit, queryText, cfg.recallUserRatio);
 
                 if (memories.length > 0) {
                   const { lines: memoryLines, estimatedTokens } = await buildMemoryLinesWithBudget(

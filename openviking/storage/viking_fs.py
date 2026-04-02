@@ -1319,6 +1319,8 @@ class VikingFS:
 
         if "/memories" in uri:
             return ContextType.MEMORY
+        elif "/episodes" in uri:
+            return ContextType.MEMORY
         elif "/skills" in uri:
             return ContextType.SKILL
         elif "/resources" in uri:

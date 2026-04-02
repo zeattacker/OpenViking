@@ -13,6 +13,16 @@ from openviking_cli.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
+
+def _log_task_exception(task: asyncio.Task) -> None:
+    """Callback for fire-and-forget tasks to log unhandled exceptions."""
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("Background task %s failed: %s", task.get_name(), exc, exc_info=exc)
+
+
 # Session-internal files that should never be summarized by the semantic pipeline.
 # These are canonical archives (e.g. session transcripts) whose content provides
 # no additional retrieval value and would only waste tokens and add latency.
@@ -187,7 +197,7 @@ class SemanticDagExecutor:
 
             for task in tasks:
                 if task.task_type == "file":
-                    asyncio.create_task(
+                    _t = asyncio.create_task(
                         self._processor._vectorize_single_file(
                             parent_uri=task.parent_uri,
                             context_type=task.context_type,
@@ -198,8 +208,9 @@ class SemanticDagExecutor:
                             use_summary=task.use_summary,
                         )
                     )
+                    _t.add_done_callback(_log_task_exception)
                 else:
-                    asyncio.create_task(
+                    _t = asyncio.create_task(
                         self._processor._vectorize_directory(
                             task.uri,
                             task.context_type,
@@ -209,6 +220,7 @@ class SemanticDagExecutor:
                             semantic_msg_id=task.semantic_msg_id,
                         )
                     )
+                    _t.add_done_callback(_log_task_exception)
         else:
             # No vectorize tasks — release lock immediately (via wrapped callback)
             try:
@@ -257,12 +269,14 @@ class SemanticDagExecutor:
                 self._stats.pending_nodes += 1
                 self._stats.pending_nodes = max(0, self._stats.pending_nodes - 1)
                 self._stats.in_progress_nodes += 1
-                asyncio.create_task(self._file_summary_task(dir_uri, file_path))
+                _t = asyncio.create_task(self._file_summary_task(dir_uri, file_path))
+                _t.add_done_callback(_log_task_exception)
 
             if children_dirs:
                 if self._recursive:
                     for child_uri in children_dirs:
-                        asyncio.create_task(self._dispatch_dir(child_uri, dir_uri))
+                        _t = asyncio.create_task(self._dispatch_dir(child_uri, dir_uri))
+                        _t.add_done_callback(_log_task_exception)
         except Exception as e:
             logger.error(f"Failed to dispatch directory {dir_uri}: {e}", exc_info=True)
             if parent_uri:
@@ -284,6 +298,10 @@ class SemanticDagExecutor:
         for entry in entries:
             name = entry.get("name", "")
             if not name or name.startswith(".") or name in [".", ".."] or name in _SKIP_FILENAMES:
+                continue
+
+            # Skip _archive directories — archived data should not be summarized or indexed
+            if name == "_archive":
                 continue
 
             item_uri = VikingURI(uri).join(name).uri

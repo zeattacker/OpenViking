@@ -45,6 +45,14 @@ export type MemoryOpenVikingConfig = {
   emitStandardDiagnostics?: boolean;
   /** When true, log tenant routing for semantic find and session writes (messages/commit) to the plugin logger. */
   logFindRequests?: boolean;
+  /** Enable multi-tier recall: include L0/L1 directory-level results alongside L2 file results. Default false. */
+  recallMultiTier?: boolean;
+  /** Ratio of recall budget allocated to user-space memories (0.0-1.0). Remaining goes to agent-space with category coverage. Default 0.6. */
+  recallUserRatio?: number;
+  /** Phase2 memory extraction poll interval in ms (default 800). */
+  phase2PollIntervalMs?: number;
+  /** Phase2 memory extraction poll timeout in ms (default 120000). */
+  phase2PollTimeoutMs?: number;
 };
 
 const DEFAULT_BASE_URL = "http://127.0.0.1:1933";
@@ -53,11 +61,11 @@ const DEFAULT_TARGET_URI = "viking://user/memories";
 const DEFAULT_TIMEOUT_MS = 15000;
 const DEFAULT_CAPTURE_MODE = "semantic";
 const DEFAULT_CAPTURE_MAX_LENGTH = 24000;
-const DEFAULT_RECALL_LIMIT = 6;
-const DEFAULT_RECALL_SCORE_THRESHOLD = 0.15;
+const DEFAULT_RECALL_LIMIT = 12;
+const DEFAULT_RECALL_SCORE_THRESHOLD = 0.10;
 const DEFAULT_RECALL_MAX_CONTENT_CHARS = 500;
 const DEFAULT_RECALL_PREFER_ABSTRACT = true;
-const DEFAULT_RECALL_TOKEN_BUDGET = 2000;
+const DEFAULT_RECALL_TOKEN_BUDGET = 4000;
 const DEFAULT_COMMIT_TOKEN_THRESHOLD = 20000;
 const DEFAULT_INGEST_REPLY_ASSIST = true;
 const DEFAULT_INGEST_REPLY_ASSIST_MIN_SPEAKER_TURNS = 2;
@@ -74,6 +82,8 @@ const DEFAULT_ALIGNMENT = {
   driftConsecutiveFlagLimit: 5,
 };
 const DEFAULT_EMIT_STANDARD_DIAGNOSTICS = false;
+const DEFAULT_PHASE2_POLL_INTERVAL_MS = 800;
+const DEFAULT_PHASE2_POLL_TIMEOUT_MS = 120_000;
 const DEFAULT_LOCAL_CONFIG_PATH = join(homedir(), ".openviking", "ov.conf");
 
 const DEFAULT_AGENT_ID = "default";
@@ -186,6 +196,10 @@ export const memoryOpenVikingConfigSchema = {
         "ingestReplyAssistIgnoreSessionPatterns",
         "emitStandardDiagnostics",
         "logFindRequests",
+        "recallMultiTier",
+        "recallUserRatio",
+        "phase2PollIntervalMs",
+        "phase2PollTimeoutMs",
       ],
       "openviking config",
     );
@@ -246,6 +260,8 @@ export const memoryOpenVikingConfigSchema = {
         100,
         Math.min(50000, Math.floor(toNumber(cfg.recallTokenBudget, DEFAULT_RECALL_TOKEN_BUDGET))),
       ),
+      recallMultiTier: cfg.recallMultiTier === true,
+      recallUserRatio: Math.max(0, Math.min(1, toNumber(cfg.recallUserRatio, 0.6))),
       commitTokenThreshold: Math.max(
         0,
         Math.min(100_000, Math.floor(toNumber(cfg.commitTokenThreshold, DEFAULT_COMMIT_TOKEN_THRESHOLD))),
@@ -297,6 +313,14 @@ export const memoryOpenVikingConfigSchema = {
         cfg.logFindRequests === true ||
         envFlag("OPENVIKING_LOG_ROUTING") ||
         envFlag("OPENVIKING_DEBUG"),
+      phase2PollIntervalMs: Math.max(
+        100,
+        Math.min(5000, Math.floor(toNumber(cfg.phase2PollIntervalMs, DEFAULT_PHASE2_POLL_INTERVAL_MS))),
+      ),
+      phase2PollTimeoutMs: Math.max(
+        5000,
+        Math.min(600_000, Math.floor(toNumber(cfg.phase2PollTimeoutMs, DEFAULT_PHASE2_POLL_TIMEOUT_MS))),
+      ),
     };
   },
   uiHints: {
@@ -436,6 +460,12 @@ export const memoryOpenVikingConfigSchema = {
       label: "Standard diagnostics (diag JSON lines)",
       advanced: true,
       help: "When enabled, emit structured openviking: diag {...} lines for assemble and afterTurn. Disable to reduce log noise.",
+    },
+    recallUserRatio: {
+      label: "Recall User-Space Ratio",
+      placeholder: "0.6",
+      advanced: true,
+      help: "Ratio of recall budget for user-space memories (0.0-1.0). Remaining budget goes to agent-space with category coverage (patterns, tools, skills).",
     },
     logFindRequests: {
       label: "Log find requests",

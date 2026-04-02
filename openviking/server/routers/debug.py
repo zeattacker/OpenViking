@@ -145,6 +145,7 @@ async def debug_distill_dry_run(
         viking_fs=service.viking_fs,
         similarity_threshold=threshold,
         min_cluster_size=cluster_size,
+        pattern_dedup_threshold=config.distillation.consolidation_pattern_dedup_threshold,
     )
 
     # Override ctx role to ROOT for background operation.
@@ -203,6 +204,7 @@ async def debug_distill_execute(
         viking_fs=service.viking_fs,
         similarity_threshold=threshold,
         min_cluster_size=cluster_size,
+        pattern_dedup_threshold=config.distillation.consolidation_pattern_dedup_threshold,
     )
 
     ctx = RequestContext(user=ctx.user, role=Role.ROOT)
@@ -221,6 +223,7 @@ async def debug_distill_execute(
             "scanned": result.scanned,
             "clusters_found": result.clusters_found,
             "patterns_created": result.patterns_created,
+            "skipped_duplicates": result.skipped_duplicates,
             "pattern_uris": result.pattern_uris,
             "errors": result.errors,
         },

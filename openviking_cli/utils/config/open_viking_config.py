@@ -57,6 +57,10 @@ class DistillationConfig(BaseModel):
     consolidation_min_cluster_size: int = Field(
         default=3, description="Minimum cluster size to trigger consolidation"
     )
+    consolidation_pattern_dedup_threshold: float = Field(
+        default=0.90,
+        description="Cosine similarity threshold to consider a new pattern a duplicate of existing",
+    )
     decay_enabled: bool = Field(default=True, description="Enable memory decay/archival")
     decay_check_interval_hours: int = Field(
         default=24, description="Hours between decay checks"
@@ -79,6 +83,15 @@ class DistillationConfig(BaseModel):
     )
     semantic_regen_min_file_delta: int = Field(
         default=5, description="Minimum file count change to trigger full regen"
+    )
+    archive_gc_enabled: bool = Field(
+        default=False, description="Enable periodic garbage collection of old archived memories"
+    )
+    archive_gc_interval_hours: int = Field(
+        default=168, description="Hours between archive GC runs (168 = weekly)"
+    )
+    archive_gc_max_age_days: int = Field(
+        default=30, description="Delete archived files older than this many days"
     )
 
     model_config = {"extra": "forbid"}

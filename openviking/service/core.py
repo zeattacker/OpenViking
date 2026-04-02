@@ -334,6 +334,7 @@ class OpenVikingService:
                 viking_fs=self._viking_fs,
                 similarity_threshold=distill_config.distillation.consolidation_similarity_threshold,
                 min_cluster_size=distill_config.distillation.consolidation_min_cluster_size,
+                pattern_dedup_threshold=distill_config.distillation.consolidation_pattern_dedup_threshold,
             )
             archiver = MemoryArchiver(
                 viking_fs=self._viking_fs,

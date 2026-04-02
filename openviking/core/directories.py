@@ -128,6 +128,8 @@ def get_context_type_for_uri(uri: str) -> str:
     """Determine context_type based on URI."""
     if "/memories" in uri:
         return ContextType.MEMORY.value
+    elif "/episodes" in uri:
+        return ContextType.MEMORY.value
     elif "/resources" in uri:
         return ContextType.RESOURCE.value
     elif "/skills" in uri:
