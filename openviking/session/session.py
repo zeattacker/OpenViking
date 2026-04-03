@@ -560,16 +560,23 @@ class Session:
 
                 # Memory extraction
                 if self._session_compressor:
-                    logger.info(
-                        f"Starting memory extraction from {len(messages)} archived messages"
-                    )
-                    extracted = await self._session_compressor.extract_long_term_memories(
-                        messages=messages,
-                        user=self.user,
-                        session_id=self.session_id,
-                        ctx=self.ctx,
-                        latest_archive_overview=latest_archive_overview,
-                    )
+                    # Check trivial filter before extraction
+                    if self._is_trivial_session(messages):
+                        logger.info(
+                            "Skipping memory extraction: session matched trivial filter"
+                        )
+                        extracted = []
+                    else:
+                        logger.info(
+                            f"Starting memory extraction from {len(messages)} archived messages"
+                        )
+                        extracted = await self._session_compressor.extract_long_term_memories(
+                            messages=messages,
+                            user=self.user,
+                            session_id=self.session_id,
+                            ctx=self.ctx,
+                            latest_archive_overview=latest_archive_overview,
+                        )
                     logger.info(f"Extracted {len(extracted)} memories")
                     for ctx_item in extracted:
                         cat = getattr(ctx_item, "category", "") or "unknown"
@@ -1024,6 +1031,55 @@ class Session:
             pending_messages.extend(await self._read_archive_messages(archive["archive_uri"]))
 
         return pending_messages
+
+    def _is_trivial_session(self, messages: List[Message]) -> bool:
+        """Check if this session is trivial (heartbeat, cron job) and should skip extraction.
+
+        Uses the configurable trivial_filter from memory config. When disabled,
+        all sessions proceed to memory extraction.
+        """
+        config = get_openviking_config()
+        trivial_config = config.memory.trivial_filter
+
+        if not trivial_config.enabled:
+            return False
+
+        # Format messages for pattern matching
+        text_parts = []
+        for msg in messages:
+            content = getattr(msg, "content", "")
+            if not content:
+                parts = getattr(msg, "parts", [])
+                for part in parts:
+                    if hasattr(part, "text") and part.text:
+                        content = part.text
+                        break
+                    elif hasattr(part, "content") and part.content:
+                        content = str(part.content)
+                        break
+            if content:
+                text_parts.append(content)
+
+        full_text = "\n".join(text_parts)
+        text_lower = full_text.lower()
+
+        # Check for trivial keyword patterns
+        for pattern in trivial_config.patterns:
+            if pattern.lower() in text_lower:
+                logger.debug(f"Trivial pattern matched: '{pattern}'")
+                return True
+
+        # Very short conversations with minimal content
+        if (
+            len(messages) <= trivial_config.min_message_count
+            and len(full_text) < trivial_config.min_content_chars
+        ):
+            logger.debug(
+                f"Trivial: short session ({len(messages)} msgs, {len(full_text)} chars)"
+            )
+            return True
+
+        return False
 
     @staticmethod
     def _archive_index_from_uri(archive_uri: str) -> int:

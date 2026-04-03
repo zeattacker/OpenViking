@@ -54,9 +54,7 @@ class EpisodeIndexer:
         else:
             return 1200
 
-    # Patterns that indicate trivial/automated conversations not worth
-    # generating an episode for.  Checked case-insensitively against the
-    # formatted message text.
+    # Fallback patterns used when config is not available or trivial_filter is disabled.
     _TRIVIAL_PATTERNS = [
         "heartbeat",
         "heartbeat_ok",
@@ -68,26 +66,37 @@ class EpisodeIndexer:
         "ping",
     ]
 
-    # Minimum characters of substantive content (after formatting) to
-    # be considered a meaningful conversation.
     _MIN_CONTENT_CHARS = 200
 
     @staticmethod
     def _is_trivial(formatted_messages: str, message_count: int) -> bool:
         """Return True if the conversation is too trivial for an episode.
 
-        Filters out heartbeats, system checks, and very short exchanges
-        that are typically from cron jobs or agent initialization.
+        Uses configurable patterns from memory.trivial_filter when available,
+        falls back to hardcoded patterns otherwise.
         """
+        from openviking_cli.utils.config import get_openviking_config
+
+        try:
+            config = get_openviking_config()
+            trivial_config = config.memory.trivial_filter
+            patterns = trivial_config.patterns
+            min_chars = trivial_config.min_content_chars
+            min_msgs = trivial_config.min_message_count
+        except Exception:
+            patterns = EpisodeIndexer._TRIVIAL_PATTERNS
+            min_chars = EpisodeIndexer._MIN_CONTENT_CHARS
+            min_msgs = 3
+
         text_lower = formatted_messages.lower()
 
         # Check for trivial keyword patterns
-        for pattern in EpisodeIndexer._TRIVIAL_PATTERNS:
-            if pattern in text_lower:
+        for pattern in patterns:
+            if pattern.lower() in text_lower:
                 return True
 
         # Very short conversations with minimal content
-        if message_count <= 3 and len(formatted_messages) < EpisodeIndexer._MIN_CONTENT_CHARS:
+        if message_count <= min_msgs and len(formatted_messages) < min_chars:
             return True
 
         return False
