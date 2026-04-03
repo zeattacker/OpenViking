@@ -839,7 +839,7 @@ export function createMemoryOpenVikingContextEngine(params: {
         const sanitized = turnText.replace(/<relevant-memories>[\s\S]*?<\/relevant-memories>/gi, " ").replace(/\s+/g, " ").trim();
 
         if (sanitized) {
-          await client.addSessionMessage(OVSessionId, "user", sanitized, agentId);
+          await client.addSessionMessage(OVSessionId, "user", sanitized, undefined, agentId);
         } else {
           diag("afterTurn_skip", OVSessionId, {
             reason: "sanitized_empty",

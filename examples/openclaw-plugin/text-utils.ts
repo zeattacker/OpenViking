@@ -19,6 +19,7 @@ export const MEMORY_TRIGGERS = [
 
 const CJK_CHAR_REGEX = /[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uac00-\ud7af]/;
 const RELEVANT_MEMORIES_BLOCK_RE = /<relevant-memories>[\s\S]*?<\/relevant-memories>/gi;
+const OPENVIKING_INJECTION_BLOCK_RE = /<(?:user-profile|tool-experience|available-memories|ingest-reply-assist)>[\s\S]*?<\/(?:user-profile|tool-experience|available-memories|ingest-reply-assist)>/gi;
 const AUTO_RECALL_BLOCK_RE = /\[Auto-invoked: memory_recall\([^\)]*\)\][\s\S]*?(?=\n\[(?:user|assistant)\]:|$)/gi;
 const CONVERSATION_METADATA_BLOCK_RE =
   /(?:^|\n)\s*(?:Conversation info|Conversation metadata|会话信息|对话信息)\s*(?:\([^)]+\))?\s*:\s*```[\s\S]*?```/gi;
@@ -57,6 +58,7 @@ function looksLikeMetadataJsonBlock(content: string): boolean {
 export function sanitizeUserTextForCapture(text: string): string {
   return text
     .replace(RELEVANT_MEMORIES_BLOCK_RE, " ")
+    .replace(OPENVIKING_INJECTION_BLOCK_RE, " ")
     .replace(AUTO_RECALL_BLOCK_RE, " ")
     .replace(CONVERSATION_METADATA_BLOCK_RE, " ")
     .replace(SENDER_METADATA_BLOCK_RE, " ")
