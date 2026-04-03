@@ -442,7 +442,9 @@ See the complete JSON Schema below:
                 item_dict = dict(item) if hasattr(item, "model_dump") else dict(item)
                 try:
                     uri = resolve_flat_model_uri(
-                        item_dict, registry, "default", "default", memory_type=field_name
+                        item_dict, registry, "default", "default",
+                        memory_type=field_name,
+                        extract_context=self._extract_context,
                     )
                 except Exception as e:
                     logger.warning(f"Failed to resolve URI for {item}: {e}")

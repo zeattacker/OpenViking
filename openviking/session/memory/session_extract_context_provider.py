@@ -52,34 +52,83 @@ class SessionExtractContextProvider(ExtractContextProvider):
         fallback_language = (config.language_fallback or "en").strip() or "en"
         return detect_language_from_conversation(conversation, fallback_language=fallback_language)
 
+    # Map memory_type to a short extraction question for the LLM prompt.
+    # Each entry: (question, guidance). Built from schema descriptions but
+    # condensed so the prompt stays small for 9B-class models.
+    _EXTRACTION_QUESTIONS = {
+        "entities": (
+            "Did anyone mention a person, company, project, product, system, or place by name?",
+            "Create an `entities` entry for each. Include what it is, who's involved, and any attributes mentioned.",
+        ),
+        "events": (
+            "Did something happen? Was something discussed, decided, planned, or agreed upon?",
+            "Create an `events` entry. Include who was involved, what was discussed/decided, and any dates or commitments.",
+        ),
+        "profile": (
+            "Did the user reveal something about themselves — their role, background, expertise, habits?",
+            "Update `profile` with that information.",
+        ),
+        "preferences": (
+            "Did the user express a preference, opinion, or way they like things done?",
+            "Create a `preferences` entry for that topic.",
+        ),
+        "tools": (
+            "Were any tools used in the conversation (look for [ToolCall] markers)?",
+            "Create `tools` entries with usage statistics.",
+        ),
+        "skills": (
+            "Were any skills used in the conversation (look for [ToolCall] markers with skill_name)?",
+            "Create `skills` entries with usage statistics.",
+        ),
+        "cases": (
+            "Was a specific problem encountered and solved during the conversation?",
+            "Create a `cases` entry with the problem description and solution. Use 'Problem → Solution' naming.",
+        ),
+        "patterns": (
+            "Was a reusable workflow, process, or method established that should be followed in similar future situations?",
+            "Create a `patterns` entry with trigger conditions, process steps, and considerations.",
+        ),
+    }
+
+    def _build_extraction_checklist(self) -> str:
+        """Build numbered checklist dynamically from enabled schemas."""
+        schemas = self._get_registry().list_all(include_disabled=False)
+        lines = []
+        idx = 1
+        seen = set()
+        for schema in schemas:
+            mt = schema.memory_type
+            if mt in seen:
+                continue
+            seen.add(mt)
+            if mt in self._EXTRACTION_QUESTIONS:
+                question, guidance = self._EXTRACTION_QUESTIONS[mt]
+            else:
+                # Fallback: use first line of schema description
+                desc_line = (schema.description or mt).strip().split("\n")[0]
+                question = f"Does the conversation contain information relevant to {mt}?"
+                guidance = f"Create a `{mt}` entry. {desc_line}"
+            lines.append(f"{idx}. **{question}**\n   → {guidance}")
+            idx += 1
+        return "\n\n".join(lines)
+
     def instruction(self) -> str:
         output_language = self._output_language
+        checklist = self._build_extraction_checklist()
         goal = f"""You are a memory extraction agent. Your job is to read a conversation and produce structured memory entries.
 
 ## What To Extract
 
 For each conversation, ask yourself these questions and create memories for every "yes":
 
-1. **Did anyone mention a person, company, project, product, system, or place by name?**
-   → Create an `entities` entry for each. Include what it is, who's involved, and any attributes mentioned.
-
-2. **Did something happen? Was something discussed, decided, planned, or agreed upon?**
-   → Create an `events` entry. Include who was involved, what was discussed/decided, and any dates or commitments.
-
-3. **Did the user reveal something about themselves — their role, background, expertise, habits?**
-   → Update `profile` with that information.
-
-4. **Did the user express a preference, opinion, or way they like things done?**
-   → Create a `preferences` entry for that topic.
-
-5. **Were any tools or skills used in the conversation (look for [ToolCall] markers)?**
-   → Create `tools`/`skills` entries with usage statistics.
+{checklist}
 
 ## Decision Rules
 
 - If the conversation contains factual information about the world → extract it
 - If the conversation reveals something about the user → extract it
 - If the conversation records an event or decision → extract it
+- If a problem was solved or a workflow was established → extract it
 - If you identified information in your reasoning but then wrote empty arrays → you made a mistake. Go back and create entries.
 - The only valid reason for empty output is a conversation with zero substantive content (e.g., only greetings with no information exchanged)
 

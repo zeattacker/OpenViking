@@ -311,6 +311,21 @@ class MemoryUpdater:
         # Convert model to dict
         model_dict = flat_model_to_dict(flat_model)
 
+        # Handle StrPatch fields in write operations
+        # (model produced SEARCH/REPLACE blocks after seeing existing content via refetch)
+        has_real_patches = False
+        for k, v in list(model_dict.items()):
+            if self._is_patch_format(v):
+                if not v.blocks:
+                    # Empty StrPatch — no-op, remove it
+                    del model_dict[k]
+                else:
+                    has_real_patches = True
+        if has_real_patches:
+            logger.debug(f"Write op contains StrPatch fields, routing to edit: {uri}")
+            await self._apply_edit(flat_model, uri, ctx)
+            return
+
         # Extract content - priority: model_dict["content"]
         content = model_dict.pop("content", None) or ""
 
@@ -423,6 +438,8 @@ class MemoryUpdater:
 
         # Deserialize content and metadata
         current_plain_content, current_metadata = deserialize_full(current_full_content)
+        if current_metadata is None:
+            current_metadata = {}
 
         # Get memory type schema
         memory_type_str = model_dict.get("memory_type") or current_metadata.get("memory_type")
