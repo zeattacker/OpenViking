@@ -20,6 +20,7 @@ from openviking.server.identity import RequestContext, Role
 from openviking.storage.errors import CollectionNotFoundError
 from openviking.storage.queuefs.embedding_msg import EmbeddingMsg
 from openviking.storage.queuefs.named_queue import DequeueHandlerBase
+from openviking.storage.viking_fs import get_viking_fs
 from openviking.storage.viking_vector_index_backend import VikingVectorIndexBackend
 from openviking.telemetry import bind_telemetry, resolve_telemetry
 from openviking.utils.circuit_breaker import (
@@ -219,6 +220,28 @@ class TextEmbeddingHandler(DequeueHandlerBase):
         if level_int == 1:
             return uri if uri.endswith("/.overview.md") else f"{uri}/.overview.md"
         return uri
+
+    async def _cleanup_vectorize_pending(self, inserted_data: Dict[str, Any]) -> None:
+        """Remove .vectorize_pending marker after successful vectorization."""
+        try:
+            uri = inserted_data.get("uri", "")
+            level = inserted_data.get("level", 2)
+            # Only clean up for directory-level vectors (L0/L1)
+            if int(level) in (0, 1) and uri:
+                viking_fs = get_viking_fs()
+                if viking_fs:
+                    marker_uri = f"{uri}/.vectorize_pending"
+                    account_id = inserted_data.get("account_id", "default")
+                    user = UserIdentifier(
+                        account_id=account_id, user_id="default", agent_id="default"
+                    )
+                    ctx = RequestContext(user=user, role=Role.ROOT)
+                    try:
+                        await viking_fs.rm(marker_uri, ctx=ctx)
+                    except Exception:
+                        pass  # Marker may not exist
+        except Exception:
+            pass  # Best-effort cleanup
 
     async def on_dequeue(self, data: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         """Process dequeued message and add embedding vector(s)."""
@@ -430,6 +453,10 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                 self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
                 self.report_success()
                 self._circuit_breaker.record_success()
+
+                # Clean up .vectorize_pending marker on success
+                await self._cleanup_vectorize_pending(inserted_data)
+
                 return inserted_data
 
         except Exception as e:

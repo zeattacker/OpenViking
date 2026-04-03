@@ -126,14 +126,12 @@ PRESET_DIRECTORIES: Dict[str, DirectoryDefinition] = {
 
 def get_context_type_for_uri(uri: str) -> str:
     """Determine context_type based on URI."""
-    if "/memories" in uri:
+    if "/memories" in uri or "/episodes" in uri or "/instructions" in uri:
         return ContextType.MEMORY.value
-    elif "/episodes" in uri:
-        return ContextType.MEMORY.value
+    elif "/skills" in uri or "/tools" in uri:
+        return ContextType.SKILL.value
     elif "/resources" in uri:
         return ContextType.RESOURCE.value
-    elif "/skills" in uri:
-        return ContextType.SKILL.value
     elif uri.startswith("viking://session"):
         return ContextType.MEMORY.value
     return ContextType.RESOURCE.value

@@ -836,8 +836,15 @@ class SemanticProcessor(DequeueHandlerBase):
         else:
             return await self._generate_text_summary(file_path, file_name, llm_sem, ctx=ctx)
 
-    def _extract_abstract_from_overview(self, overview_content: str) -> str:
-        """Extract abstract from overview.md."""
+    def _extract_abstract_from_overview(
+        self, overview_content: str, context_type: str = ""
+    ) -> str:
+        """Extract abstract from overview.md.
+
+        Extracts the brief description paragraph (between H1 and first H2).
+        Falls back to first N chars of overview content (skipping headers)
+        when first-paragraph extraction yields insufficient text.
+        """
         lines = overview_content.split("\n")
 
         # Skip header lines (starting with #)
@@ -857,7 +864,22 @@ class SemanticProcessor(DequeueHandlerBase):
                 if line.strip():
                     content_lines.append(line.strip())
 
-        return "\n".join(content_lines).strip()
+        abstract = "\n".join(content_lines).strip()
+
+        # Fallback: if extraction is empty or too short, use first content
+        # lines from the overview (skipping markdown headers)
+        if len(abstract) < 50 and overview_content.strip():
+            fallback_lines = []
+            for line in lines:
+                stripped = line.strip()
+                if stripped and not stripped.startswith("#"):
+                    fallback_lines.append(stripped)
+                    if len(" ".join(fallback_lines)) >= 200:
+                        break
+            if fallback_lines:
+                abstract = " ".join(fallback_lines)
+
+        return abstract
 
     @staticmethod
     def _build_overview_from_summaries(
@@ -878,13 +900,40 @@ class SemanticProcessor(DequeueHandlerBase):
                 lines.append(f"[{idx}] {item['name']}: (no summary)")
         return "\n".join(lines)
 
-    def _enforce_size_limits(self, overview: str, abstract: str) -> Tuple[str, str]:
-        """Enforce max size limits on overview and abstract."""
+    def _enforce_size_limits(
+        self, overview: str, abstract: str, context_type: str = ""
+    ) -> Tuple[str, str]:
+        """Enforce max size limits on overview and abstract.
+
+        Uses context-type-aware limits when available, with clean truncation
+        at paragraph/section boundaries instead of mid-text.
+        """
         semantic = get_openviking_config().semantic
-        if len(overview) > semantic.overview_max_chars:
-            overview = overview[: semantic.overview_max_chars]
-        if len(abstract) > semantic.abstract_max_chars:
-            abstract = abstract[: semantic.abstract_max_chars - 3] + "..."
+        limits = semantic.get_limits(context_type)
+
+        if len(overview) > limits.overview_max_chars:
+            # Truncate at last paragraph or section boundary
+            truncated = overview[: limits.overview_max_chars]
+            # Try to find last clean break point
+            for sep in ("\n## ", "\n\n", "\n"):
+                last_break = truncated.rfind(sep)
+                if last_break > limits.overview_max_chars // 2:
+                    truncated = truncated[:last_break]
+                    break
+            overview = truncated
+
+        if len(abstract) > limits.abstract_max_chars:
+            # Truncate at last sentence boundary
+            truncated = abstract[: limits.abstract_max_chars]
+            for sep in (". ", "。", "\n"):
+                last_break = truncated.rfind(sep)
+                if last_break > limits.abstract_max_chars // 2:
+                    truncated = truncated[: last_break + len(sep)]
+                    break
+            else:
+                truncated = truncated[: limits.abstract_max_chars - 3] + "..."
+            abstract = truncated
+
         return overview, abstract
 
     def _parse_overview_md(self, overview_content: str) -> Dict[str, str]:
@@ -946,6 +995,7 @@ class SemanticProcessor(DequeueHandlerBase):
         file_summaries: List[Dict[str, str]],
         children_abstracts: List[Dict[str, str]],
         llm_sem: Optional[asyncio.Semaphore] = None,
+        context_type: str = "",
     ) -> str:
         """Generate directory's .overview.md (L1).
 
@@ -958,6 +1008,8 @@ class SemanticProcessor(DequeueHandlerBase):
             dir_uri: Directory URI
             file_summaries: File summary list
             children_abstracts: Subdirectory summary list
+            llm_sem: Optional semaphore for LLM concurrency control
+            context_type: Context type for resolving size limits
 
         Returns:
             Overview content
@@ -966,6 +1018,7 @@ class SemanticProcessor(DequeueHandlerBase):
         config = get_openviking_config()
         vlm = config.vlm
         semantic = config.semantic
+        limits = semantic.get_limits(context_type)
 
         if not vlm.is_available():
             logger.warning("VLM not available, using default overview")
@@ -1011,6 +1064,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 file_index_map,
                 llm_sem=llm_sem,
                 output_language=output_language,
+                max_words=limits.overview_max_words,
             )
         elif over_budget:
             # Few files but long summaries → truncate summaries to fit budget
@@ -1033,6 +1087,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 children_abstracts_str,
                 file_index_map,
                 output_language=output_language,
+                max_words=limits.overview_max_words,
             )
         else:
             overview = await self._single_generate_overview(
@@ -1041,6 +1096,7 @@ class SemanticProcessor(DequeueHandlerBase):
                 children_abstracts_str,
                 file_index_map,
                 output_language=output_language,
+                max_words=limits.overview_max_words,
             )
 
         return overview
@@ -1052,6 +1108,7 @@ class SemanticProcessor(DequeueHandlerBase):
         children_abstracts_str: str,
         file_index_map: Dict[int, str],
         output_language: str = "en",
+        max_words: int = 800,
     ) -> str:
         """Generate overview from a single prompt (small directories)."""
         import re
@@ -1066,6 +1123,7 @@ class SemanticProcessor(DequeueHandlerBase):
                     "file_summaries": file_summaries_str,
                     "children_abstracts": children_abstracts_str,
                     "output_language": output_language,
+                    "max_words": max_words,
                 },
             )
 
@@ -1095,6 +1153,7 @@ class SemanticProcessor(DequeueHandlerBase):
         file_index_map: Dict[int, str],
         llm_sem: Optional[asyncio.Semaphore] = None,
         output_language: str = "en",
+        max_words: int = 800,
     ) -> str:
         """Generate overview by batching file summaries and merging.
 

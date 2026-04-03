@@ -3,6 +3,7 @@
 """Semantic DAG executor with event-driven lazy dispatch."""
 
 import asyncio
+import hashlib
 from dataclasses import dataclass, field
 from typing import Awaitable, Callable, Dict, List, Optional
 
@@ -111,6 +112,7 @@ class SemanticDagExecutor:
         self._vectorize_lock = asyncio.Lock()
         self._file_change_status: Dict[str, bool] = {}
         self._dir_change_status: Dict[str, bool] = {}
+        self._summary_hash_changed: Dict[str, bool] = {}
         self._overview_cache: Dict[str, Dict[str, str]] = {}
         self._overview_cache_lock = asyncio.Lock()
         self._refresh_task: Optional[asyncio.Task] = None
@@ -432,6 +434,7 @@ class SemanticDagExecutor:
         need_vectorize = True
         try:
             summary_dict = None
+            old_summary = None
             if self._incremental_update:
                 content_changed = await self._check_file_content_changed(file_path)
                 self._file_change_status[file_path] = content_changed
@@ -439,15 +442,31 @@ class SemanticDagExecutor:
                 if not content_changed:
                     summary_dict = await self._read_existing_summary(file_path)
                     need_vectorize = False
+                else:
+                    # Read old summary for hash comparison
+                    old_summary = await self._read_existing_summary(file_path)
             else:
                 self._file_change_status[file_path] = True
             if summary_dict is None:
                 summary_dict = await self._processor._generate_single_file_summary(
                     file_path, llm_sem=self._llm_sem, ctx=self._ctx
                 )
+
+            # Track whether summary content actually changed (hash comparison)
+            new_text = summary_dict.get("summary", "")
+            if old_summary is not None:
+                old_text = old_summary.get("summary", "")
+                old_hash = hashlib.md5(old_text.encode()).hexdigest()
+                new_hash = hashlib.md5(new_text.encode()).hexdigest()
+                self._summary_hash_changed[file_path] = old_hash != new_hash
+                if old_hash == new_hash:
+                    need_vectorize = False
+            else:
+                self._summary_hash_changed[file_path] = True
         except Exception as e:
             logger.warning(f"Failed to generate summary for {file_path}: {e}")
             summary_dict = {"name": file_name, "summary": ""}
+            self._summary_hash_changed[file_path] = True
         finally:
             self._stats.done_nodes += 1
             self._stats.in_progress_nodes = max(0, self._stats.in_progress_nodes - 1)
@@ -537,6 +556,112 @@ class SemanticDagExecutor:
                 results.append(item)
         return results
 
+    async def _sort_by_hotness(
+        self,
+        dir_uri: str,
+        file_summaries: List[Dict[str, str]],
+        file_paths: List[str],
+    ) -> List[Dict[str, str]]:
+        """Sort file summaries by active_count (most recalled first).
+
+        Queries VikingDB for active_count per file URI and sorts file_summaries
+        by descending recall count. Falls back to original order if VikingDB is
+        unavailable or context_type is not memory/skill.
+        """
+        if self._context_type not in ("memory", "skill"):
+            return file_summaries
+
+        if not file_summaries:
+            return file_summaries
+
+        try:
+            from openviking.service.core import get_service
+
+            service = get_service()
+            if not service or not service.vikingdb_manager:
+                return file_summaries
+
+            # Build filename -> active_count map
+            active_counts: Dict[str, int] = {}
+            for file_path in file_paths:
+                try:
+                    records = await service.vikingdb_manager.get_context_by_uri(
+                        uri=file_path, level=2, limit=1, ctx=self._ctx
+                    )
+                    if records:
+                        ac = records[0].get("active_count", 0)
+                        file_name = file_path.split("/")[-1]
+                        active_counts[file_name] = ac
+                except Exception:
+                    continue
+
+            if not active_counts:
+                return file_summaries
+
+            # Sort by active_count descending, preserve order for unscored items
+            sorted_summaries = sorted(
+                file_summaries,
+                key=lambda item: -active_counts.get(item.get("name", ""), 0),
+            )
+
+            logger.debug(
+                "[SemanticDag] Sorted %d file summaries by active_count for %s",
+                len(sorted_summaries),
+                dir_uri,
+            )
+            return sorted_summaries
+
+        except Exception as e:
+            logger.debug("[SemanticDag] Hotness query failed for %s: %s", dir_uri, e)
+            return file_summaries
+
+    def _build_hotness_abstract(
+        self,
+        dir_uri: str,
+        file_summaries: List[Dict[str, str]],
+        overview: str,
+    ) -> str:
+        """Build a hotness-aware abstract for memory/skill directories.
+
+        Highlights top accessed items by name and brief description.
+        Falls back to overview extraction when file_summaries are empty.
+        """
+        dir_name = dir_uri.rstrip("/").split("/")[-1]
+        total = len(file_summaries)
+
+        # Take top items (already sorted by hotness from _sort_by_hotness)
+        top_n = min(5, total)
+        top_items = file_summaries[:top_n]
+
+        parts = [f"{dir_name}: {total} items."]
+
+        if top_items:
+            highlights = []
+            for item in top_items:
+                name = item.get("name", "").replace(".md", "")
+                summary = item.get("summary", "").strip()
+                if summary:
+                    # Take first sentence
+                    first_sentence = summary.split(". ")[0].split("。")[0]
+                    if len(first_sentence) > 60:
+                        first_sentence = first_sentence[:57] + "..."
+                    highlights.append(f"{name} ({first_sentence})")
+                else:
+                    highlights.append(name)
+            parts.append("Key: " + ", ".join(highlights) + ".")
+
+        abstract = " ".join(parts)
+
+        # If abstract is too short, supplement from overview
+        if len(abstract) < 80:
+            fallback = self._processor._extract_abstract_from_overview(
+                overview, context_type=self._context_type
+            )
+            if len(fallback) > len(abstract):
+                abstract = fallback
+
+        return abstract
+
     async def _overview_task(self, dir_uri: str) -> None:
         node = self._nodes.get(dir_uri)
         if not node:
@@ -556,15 +681,56 @@ class SemanticDagExecutor:
                     need_vectorize = False
                     overview, abstract = await self._read_existing_overview_abstract(dir_uri)
             if overview is None or abstract is None:
+                # Hash-based skip: if no child summary actually changed content,
+                # reuse existing overview to avoid unnecessary LLM call
+                any_child_changed = any(
+                    self._summary_hash_changed.get(fp, True) for fp in node.file_paths
+                ) or any(
+                    self._dir_change_status.get(cd, True) for cd in node.children_dirs
+                )
+                if not any_child_changed:
+                    existing = await self._read_existing_overview_abstract(dir_uri)
+                    if existing[0] is not None and existing[1] is not None:
+                        overview, abstract = existing
+                        need_vectorize = False
+                        logger.debug(
+                            "[SemanticDag] Skipping overview regen for %s "
+                            "(no child summary changes)",
+                            dir_uri,
+                        )
+
+            if overview is None or abstract is None:
                 async with node.lock:
                     file_summaries = self._finalize_file_summaries(node)
                     children_abstracts = self._finalize_children_abstracts(node)
+
+                # Sort file summaries by hotness (most recalled first)
+                file_summaries = await self._sort_by_hotness(
+                    dir_uri, file_summaries, node.file_paths
+                )
+
                 async with self._llm_sem:
                     overview = await self._processor._generate_overview(
-                        dir_uri, file_summaries, children_abstracts
+                        dir_uri,
+                        file_summaries,
+                        children_abstracts,
+                        context_type=self._context_type,
                     )
-                abstract = self._processor._extract_abstract_from_overview(overview)
-                overview, abstract = self._processor._enforce_size_limits(overview, abstract)
+
+                # Generate abstract: for memory/skill dirs with hotness data,
+                # build a richer abstract highlighting top items
+                if self._context_type in ("memory", "skill") and file_summaries:
+                    abstract = self._build_hotness_abstract(
+                        dir_uri, file_summaries, overview
+                    )
+                else:
+                    abstract = self._processor._extract_abstract_from_overview(
+                        overview, context_type=self._context_type
+                    )
+
+                overview, abstract = self._processor._enforce_size_limits(
+                    overview, abstract, context_type=self._context_type
+                )
 
             # Write directly — protected by the outer lifecycle SUBTREE lock
             try:
@@ -575,6 +741,13 @@ class SemanticDagExecutor:
 
             try:
                 if need_vectorize:
+                    # Write pending marker before enqueuing vectorization
+                    try:
+                        await self._viking_fs.write_file(
+                            f"{dir_uri}/.vectorize_pending", "", ctx=self._ctx
+                        )
+                    except Exception:
+                        pass
                     task = VectorizeTask(
                         task_type="directory",
                         uri=dir_uri,

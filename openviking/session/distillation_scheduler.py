@@ -79,6 +79,10 @@ class DistillationScheduler:
                 distill_cfg.archive_gc_max_age_days,
             )
 
+        # Always start vectorize recovery loop
+        self._tasks.append(asyncio.create_task(self._vectorize_recovery_loop()))
+        logger.info("[DistillationScheduler] Vectorize recovery loop started (interval=30m)")
+
     async def stop(self) -> None:
         """Stop all background loops."""
         if not self._running:
@@ -434,6 +438,119 @@ class DistillationScheduler:
             except Exception as e:
                 logger.error(
                     "[DistillationScheduler] Archive GC error: %s", e, exc_info=True
+                )
+
+    async def _vectorize_recovery_loop(self) -> None:
+        """Periodically scan for .vectorize_pending markers and re-enqueue vectorization.
+
+        Runs every 30 minutes. Finds directories where semantic pipeline wrote
+        .abstract.md/.overview.md but vectorization failed (marker not cleaned up).
+        Re-enqueues these for vectorization.
+        """
+        from openviking.storage.viking_fs import get_viking_fs
+        from openviking.utils.embedding_utils import vectorize_directory_meta
+
+        interval_secs = 30 * 60  # 30 minutes
+        first_run = True
+
+        while self._running:
+            if first_run:
+                # Wait 5 minutes before first check to let startup finish
+                first_run = False
+                try:
+                    await asyncio.sleep(300)
+                except asyncio.CancelledError:
+                    break
+            else:
+                try:
+                    await asyncio.sleep(interval_secs)
+                except asyncio.CancelledError:
+                    break
+
+            if not self._running:
+                break
+
+            try:
+                viking_fs = get_viking_fs()
+                if not viking_fs:
+                    continue
+
+                ctx = self._make_ctx()
+                scopes = await self._get_user_scopes()
+                recovered = 0
+
+                for scope in scopes:
+                    # Scan common memory/skill/resource directories
+                    for subdir in [
+                        "memories/entities", "memories/events",
+                        "memories/preferences", "memories/patterns",
+                        "memories/cases", "episodes", "skills",
+                    ]:
+                        dir_uri = f"{scope}/{subdir}"
+                        try:
+                            entries = await viking_fs.ls(dir_uri)
+                        except Exception:
+                            continue
+
+                        for entry in entries:
+                            if not isinstance(entry, dict):
+                                continue
+                            if not entry.get("isDir", False):
+                                continue
+                            child_uri = f"{dir_uri}/{entry['name']}"
+                            # Check for pending marker
+                            try:
+                                marker_entries = await viking_fs.ls(child_uri)
+                                has_marker = any(
+                                    isinstance(e, dict) and e.get("name") == ".vectorize_pending"
+                                    for e in marker_entries
+                                )
+                                if not has_marker:
+                                    continue
+                            except Exception:
+                                continue
+
+                            # Read abstract and overview
+                            try:
+                                abstract = await viking_fs.read(
+                                    f"{child_uri}/.abstract.md"
+                                )
+                                overview = await viking_fs.read(
+                                    f"{child_uri}/.overview.md"
+                                )
+                                if abstract and overview:
+                                    from openviking.core.directories import (
+                                        get_context_type_for_uri,
+                                    )
+
+                                    ct = get_context_type_for_uri(child_uri)
+                                    await vectorize_directory_meta(
+                                        uri=child_uri,
+                                        abstract=abstract,
+                                        overview=overview,
+                                        context_type=ct,
+                                        ctx=ctx,
+                                    )
+                                    recovered += 1
+                                    logger.info(
+                                        "[DistillationScheduler] Re-enqueued vectorization "
+                                        "for %s (recovery)",
+                                        child_uri,
+                                    )
+                            except Exception as e:
+                                logger.debug(
+                                    "[DistillationScheduler] Recovery read failed for %s: %s",
+                                    child_uri, e,
+                                )
+
+                if recovered > 0:
+                    logger.info(
+                        "[DistillationScheduler] Vectorize recovery: re-enqueued %d directories",
+                        recovered,
+                    )
+            except Exception as e:
+                logger.error(
+                    "[DistillationScheduler] Vectorize recovery error: %s", e, exc_info=True
                 )
 
     def _make_ctx(self) -> RequestContext:

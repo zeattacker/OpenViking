@@ -34,13 +34,13 @@ class _FakeProcessor:
     async def _generate_single_file_summary(self, file_path, llm_sem=None, ctx=None):
         return {"name": file_path.split("/")[-1], "summary": "summary"}
 
-    async def _generate_overview(self, dir_uri, file_summaries, children_abstracts):
+    async def _generate_overview(self, dir_uri, file_summaries, children_abstracts, **kwargs):
         return "overview"
 
-    def _extract_abstract_from_overview(self, overview):
+    def _extract_abstract_from_overview(self, overview, **kwargs):
         return "abstract"
 
-    def _enforce_size_limits(self, overview, abstract):
+    def _enforce_size_limits(self, overview, abstract, **kwargs):
         return overview, abstract
 
     async def _vectorize_directory(

@@ -76,7 +76,9 @@ class DistillationConfig(BaseModel):
         description="Memory subdirectories to scan for consolidation (e.g. cases, entities)",
     )
     semantic_regen_enabled: bool = Field(
-        default=True, description="Enable scheduled full semantic overview regeneration"
+        default=False,
+        description="Enable scheduled full semantic overview regeneration. "
+        "Disabled by default — per-write triggers handle incremental updates.",
     )
     semantic_regen_hour_utc: int = Field(
         default=21, description="Hour (UTC) to run full semantic regen (21 = 04:00 WIB)"

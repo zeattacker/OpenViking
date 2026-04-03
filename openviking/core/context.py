@@ -113,11 +113,9 @@ class Context:
 
     def _derive_context_type(self) -> str:
         """Derive context type from URI using substring matching."""
-        if "/skills" in self.uri:
+        if "/skills" in self.uri or "/tools" in self.uri:
             return "skill"
-        elif "/memories" in self.uri:
-            return "memory"
-        elif "/episodes" in self.uri:
+        elif "/memories" in self.uri or "/episodes" in self.uri or "/instructions" in self.uri:
             return "memory"
         else:
             return "resource"

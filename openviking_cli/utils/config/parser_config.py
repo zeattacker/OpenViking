@@ -8,7 +8,7 @@ scattered across different modules. All configurations inherit from ParserConfig
 and can be loaded from ov.conf files.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Optional, Union
 
@@ -522,6 +522,20 @@ class DirectoryConfig(ParserConfig):
 
 
 @dataclass
+class SemanticSizeLimits:
+    """Per-context-type size limits for overview/abstract generation."""
+
+    abstract_max_chars: int = 256
+    """Maximum characters for generated abstracts."""
+
+    overview_max_chars: int = 4000
+    """Maximum characters for generated overviews."""
+
+    overview_max_words: int = 800
+    """Target word count passed to LLM prompt for overview generation."""
+
+
+@dataclass
 class SemanticConfig:
     """
     Configuration for semantic processing (overview/abstract generation).
@@ -544,10 +558,31 @@ class SemanticConfig:
     """Maximum number of file summaries per batch when splitting oversized prompts."""
 
     abstract_max_chars: int = 256
-    """Maximum characters for generated abstracts."""
+    """Maximum characters for generated abstracts (fallback default)."""
 
     overview_max_chars: int = 4000
-    """Maximum characters for generated overviews."""
+    """Maximum characters for generated overviews (fallback default)."""
+
+    limits_memory: SemanticSizeLimits = field(default_factory=lambda: SemanticSizeLimits(
+        abstract_max_chars=512,
+        overview_max_chars=8000,
+        overview_max_words=1500,
+    ))
+    """Size limits for memory context type (entities, events, preferences, etc.)."""
+
+    limits_skill: SemanticSizeLimits = field(default_factory=lambda: SemanticSizeLimits(
+        abstract_max_chars=384,
+        overview_max_chars=4000,
+        overview_max_words=800,
+    ))
+    """Size limits for skill context type (skills, tools)."""
+
+    limits_resource: SemanticSizeLimits = field(default_factory=lambda: SemanticSizeLimits(
+        abstract_max_chars=256,
+        overview_max_chars=3000,
+        overview_max_words=600,
+    ))
+    """Size limits for resource context type (code repos, uploaded docs)."""
 
     memory_chunk_chars: int = 2000
     """Maximum characters per chunk when splitting long memories for vectorization.
@@ -558,6 +593,27 @@ class SemanticConfig:
 
     summary_enqueue_cooldown_seconds: int = 300
     """Minimum interval before re-enqueuing the same semantic summary request after completion."""
+
+    def get_limits(self, context_type: str = "") -> SemanticSizeLimits:
+        """Resolve size limits for a given context type.
+
+        Args:
+            context_type: One of "memory", "skill", "resource", or empty string.
+
+        Returns:
+            SemanticSizeLimits for the given context type, or fallback defaults.
+        """
+        if context_type == "memory":
+            return self.limits_memory
+        elif context_type == "skill":
+            return self.limits_skill
+        elif context_type == "resource":
+            return self.limits_resource
+        # Fallback to flat defaults
+        return SemanticSizeLimits(
+            abstract_max_chars=self.abstract_max_chars,
+            overview_max_chars=self.overview_max_chars,
+        )
 
 
 # Configuration registry for dynamic loading
