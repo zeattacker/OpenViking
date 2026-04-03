@@ -15,7 +15,6 @@ from openviking.server.identity import RequestContext
 from openviking.session.memory.dataclass import MemoryOperations
 from openviking.session.memory.schema_model_generator import (
     SchemaModelGenerator,
-    SchemaPromptGenerator,
 )
 from openviking.session.memory.tools import (
     MEMORY_TOOLS_REGISTRY,
@@ -74,7 +73,6 @@ class ExtractLoop:
 
         # Schema 生成器（在 run() 中初始化）
         self.schema_model_generator = None
-        self.schema_prompt_generator = None
         self._json_schema = None
 
         # 预计算：避免每次迭代重复计算
@@ -104,7 +102,6 @@ class ExtractLoop:
 
         # 初始化 schema 生成器（使用 schemas 而非 registry）
         self.schema_model_generator = SchemaModelGenerator(schemas)
-        self.schema_prompt_generator = SchemaPromptGenerator(schemas)
         self.schema_model_generator.generate_all_models()
         self._json_schema = self.schema_model_generator.get_llm_json_schema()
 
@@ -195,10 +192,11 @@ See the complete JSON Schema below:
                     logger.info(f"Found unread existing files: {refetch_uris}, refetching...")
                     # Add refetch results to messages and continue loop
                     await self._add_refetch_results_to_messages(messages, refetch_uris)
-                    # Allow one extra iteration for refetch
-                    if iteration >= max_iterations:
+                    # Allow one extra iteration for refetch (max 2 extensions total)
+                    hard_cap = self.max_iterations + 2
+                    if iteration >= max_iterations and max_iterations < hard_cap:
                         max_iterations += 1
-                        logger.info(f"Extended max_iterations to {max_iterations} for refetch")
+                        logger.info(f"Extended max_iterations to {max_iterations} for refetch (hard cap: {hard_cap})")
 
                     continue
 
