@@ -138,23 +138,18 @@ class ExtractLoop:
         schema_str = json.dumps(self._json_schema, ensure_ascii=False)
 
         messages = []
-        # instruction() 返回字符串，需要包装成 message 格式
+        # Single system message (some models reject multiple system messages)
+        instruction_text = self.context_provider.instruction()
         messages.append(
             {
                 "role": "system",
-                "content": self.context_provider.instruction(),
-            }
-        )
-        messages.append(
-            {
-                "role": "system",
-                "content": f"""
+                "content": f"""{instruction_text}
+
 ## Output Format
 See the complete JSON Schema below:
 ```json
 {schema_str}
-```
-        """,
+```""",
             }
         )
 
@@ -321,12 +316,20 @@ See the complete JSON Schema below:
         # Call LLM with tools - use tools from strategy
         tool_choice = "none" if force_final else None
 
-        response = await self.vlm.get_completion_async(
-            messages=messages,
-            tools=self._tool_schemas,
-            tool_choice=tool_choice,
-            max_retries=self.vlm.max_retries,
-        )
+        call_kwargs: dict = dict(messages=messages)
+        if force_final:
+            # Remove tools entirely so model can't even attempt tool calls
+            pass
+        else:
+            call_kwargs["tools"] = self._tool_schemas
+            call_kwargs["tool_choice"] = tool_choice
+        # Only pass max_retries if the backend supports it (e.g. Volcengine).
+        if hasattr(self.vlm, "max_retries"):
+            import inspect
+            sig = inspect.signature(self.vlm.get_completion_async)
+            if "max_retries" in sig.parameters:
+                call_kwargs["max_retries"] = self.vlm.max_retries
+        response = await self.vlm.get_completion_async(**call_kwargs)
         # print(f'response={response}')
         # Log cache hit info
         if hasattr(response, "usage") and response.usage:
@@ -348,7 +351,7 @@ See the complete JSON Schema below:
                 )
 
         # Case 1: LLM returned tool calls
-        if response.has_tool_calls:
+        if hasattr(response, "has_tool_calls") and response.has_tool_calls:
             # Format tool calls nicely for debug logging
             for tc in response.tool_calls:
                 logger.info(f"[assistant tool_call] (id={tc.id}, name={tc.name})")
@@ -356,7 +359,7 @@ See the complete JSON Schema below:
             return (response.tool_calls, None)
 
         # Case 2: Try to parse MemoryOperations from content with stability
-        content = response.content or ""
+        content = (response.content if hasattr(response, "content") else str(response)) or ""
         if content:
             try:
                 # print(f'LLM response content: {content}')

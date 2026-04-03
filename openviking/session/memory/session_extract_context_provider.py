@@ -54,17 +54,47 @@ class SessionExtractContextProvider(ExtractContextProvider):
 
     def instruction(self) -> str:
         output_language = self._output_language
-        goal = f"""You are a memory extraction agent. Your task is to analyze conversations and update memories.
+        goal = f"""You are a memory extraction agent. Your job is to read a conversation and produce structured memory entries.
+
+## What To Extract
+
+For each conversation, ask yourself these questions and create memories for every "yes":
+
+1. **Did anyone mention a person, company, project, product, system, or place by name?**
+   → Create an `entities` entry for each. Include what it is, who's involved, and any attributes mentioned.
+
+2. **Did something happen? Was something discussed, decided, planned, or agreed upon?**
+   → Create an `events` entry. Include who was involved, what was discussed/decided, and any dates or commitments.
+
+3. **Did the user reveal something about themselves — their role, background, expertise, habits?**
+   → Update `profile` with that information.
+
+4. **Did the user express a preference, opinion, or way they like things done?**
+   → Create a `preferences` entry for that topic.
+
+5. **Were any tools or skills used in the conversation (look for [ToolCall] markers)?**
+   → Create `tools`/`skills` entries with usage statistics.
+
+## Decision Rules
+
+- If the conversation contains factual information about the world → extract it
+- If the conversation reveals something about the user → extract it
+- If the conversation records an event or decision → extract it
+- If you identified information in your reasoning but then wrote empty arrays → you made a mistake. Go back and create entries.
+- The only valid reason for empty output is a conversation with zero substantive content (e.g., only greetings with no information exchanged)
 
 ## Workflow
-1. Analyze the conversation and pre-fetched context
-2. If you need more information, use the available tools (read/search)
-3. When you have enough information, output ONLY a JSON object (no extra text before or after)
+1. Analyze the conversation and the pre-fetched .overview.md files (already provided below)
+2. The overviews tell you what memories already exist — use them to avoid duplicates
+3. Output ONLY a JSON object with your memory operations (no extra text before or after)
+4. Do NOT call read/search tools unless you need to EDIT an existing memory file's content
+5. For NEW memories, you have enough context from the overviews — output JSON directly
 
-## Critical
-- ONLY read and search tools are available - DO NOT use write tool
-- Before editing ANY existing memory file, you MUST first read its complete content
-- ONLY read URIs that are explicitly listed in ls tool results or returned by previous tool calls
+## Rules
+- PREFER outputting JSON directly over making tool calls
+- Only use read tool if you must PATCH/EDIT an existing file (need exact content for SEARCH/REPLACE)
+- For NEW entities/events, the overviews are sufficient — do NOT read individual files
+- ONLY read URIs that are explicitly listed in search results or overview links
 
 ## Target Output Language
 All memory content MUST be written in {output_language}.
@@ -122,7 +152,9 @@ Relative times (e.g., 'last week', 'next month') are based on Session Time, not 
 
 {conversation}
 
-After exploring, analyze the conversation and output ALL memory write/edit/delete operations in a single response. Do not output operations one at a time - gather all changes first, then return them together.""",
+After exploring, analyze the conversation and output ALL memory write/edit/delete operations in a single response. Do not output operations one at a time - gather all changes first, then return them together.
+
+Before finalizing: review your reasoning. If you identified facts, people, or events but your output arrays are empty, you have a contradiction — go back and create the entries.""",
         }
 
     def _assemble_conversation(self, messages: Any) -> str:
