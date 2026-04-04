@@ -535,68 +535,43 @@ class SemanticProcessor(DequeueHandlerBase):
         # or may have wrong context_type (e.g. "resource" from root reindex).
         # The deterministic ID (md5 of account:uri) ensures upsert replaces
         # any existing record with the correct context_type="memory".
-        await self._vectorize_memory_files(file_paths, ctx)
+        await self._vectorize_memory_files(
+            file_paths, file_summaries, dir_uri, ctx, msg.id
+        )
 
     async def _vectorize_memory_files(
         self,
         file_uris: List[str],
+        file_summaries: List[Dict[str, str]],
+        dir_uri: str,
         ctx: Optional[RequestContext] = None,
+        semantic_msg_id: Optional[str] = None,
     ) -> None:
         """Vectorize individual memory files with context_type='memory'.
 
-        Ensures each memory file has a vector record with the correct
-        context_type.  Uses the same pattern as
-        ``memory_updater._vectorize_memories()`` so that records created here
-        are indistinguishable from those created by the normal extraction flow.
+        Reuses ``_vectorize_single_file()`` (which delegates to
+        ``embedding_utils.vectorize_file()``) so the resulting vector records
+        are identical to those produced by the standard resource pipeline —
+        except with ``context_type="memory"``.
 
         The VectorDB ID is deterministic (md5 of account_id:uri), so upserting
         will replace any stale record (e.g. one with context_type='resource'
         left by an earlier root reindex).
         """
-        from openviking.core.context import Context, ContextLevel, Vectorize
-        from openviking.session.memory.utils.messages import parse_memory_file_with_fields
-        from openviking.storage.queuefs.embedding_msg_converter import EmbeddingMsgConverter
-
-        viking_fs = get_viking_fs()
-        active_ctx = ctx or self._current_ctx
-        if not active_ctx:
-            return
-
-        from openviking.service.core import get_service
-
-        service = get_service()
-        if not service or not service.vikingdb_manager:
-            return
-
         enqueued = 0
-        for uri in file_uris:
+        for uri, summary_dict in zip(file_uris, file_summaries):
+            if not summary_dict:
+                continue
             try:
-                content = await viking_fs.read_file(uri, ctx=active_ctx) or ""
-                if not content.strip():
-                    continue
-
-                parsed = parse_memory_file_with_fields(content)
-                abstract = parsed.get("content", "")
-
-                parent_uri = VikingURI(uri).parent.uri
-
-                memory_context = Context(
-                    uri=uri,
-                    parent_uri=parent_uri,
-                    is_leaf=True,
-                    abstract=abstract,
+                await self._vectorize_single_file(
+                    file_path=uri,
+                    summary_dict=summary_dict,
+                    parent_uri=dir_uri,
                     context_type="memory",
-                    level=ContextLevel.DETAIL,
-                    user=active_ctx.user,
-                    account_id=active_ctx.account_id,
+                    ctx=ctx,
+                    semantic_msg_id=semantic_msg_id,
                 )
-                memory_context.set_vectorize(Vectorize(text=content))
-
-                embedding_msg = EmbeddingMsgConverter.from_context(memory_context)
-                if embedding_msg:
-                    await service.vikingdb_manager.enqueue_embedding_msg(embedding_msg)
-                    enqueued += 1
-
+                enqueued += 1
             except Exception as e:
                 logger.warning(f"Failed to vectorize memory file {uri}: {e}")
 
