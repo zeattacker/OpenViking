@@ -528,6 +528,81 @@ class SemanticProcessor(DequeueHandlerBase):
         )
         logger.info(f"Vectorized abstract.md and overview.md for {dir_uri}")
 
+        # Vectorize individual memory files that are missing correct vectors.
+        # In the normal extraction flow, memory_updater._vectorize_memories()
+        # handles this inline. But when files are written via REST API or
+        # reindex is triggered manually, files may not have been vectorized
+        # or may have wrong context_type (e.g. "resource" from root reindex).
+        # The deterministic ID (md5 of account:uri) ensures upsert replaces
+        # any existing record with the correct context_type="memory".
+        await self._vectorize_memory_files(file_paths, ctx)
+
+    async def _vectorize_memory_files(
+        self,
+        file_uris: List[str],
+        ctx: Optional[RequestContext] = None,
+    ) -> None:
+        """Vectorize individual memory files with context_type='memory'.
+
+        Ensures each memory file has a vector record with the correct
+        context_type.  Uses the same pattern as
+        ``memory_updater._vectorize_memories()`` so that records created here
+        are indistinguishable from those created by the normal extraction flow.
+
+        The VectorDB ID is deterministic (md5 of account_id:uri), so upserting
+        will replace any stale record (e.g. one with context_type='resource'
+        left by an earlier root reindex).
+        """
+        from openviking.core.context import Context, ContextLevel, Vectorize
+        from openviking.session.memory.utils.messages import parse_memory_file_with_fields
+        from openviking.storage.queuefs.embedding_msg_converter import EmbeddingMsgConverter
+
+        viking_fs = get_viking_fs()
+        active_ctx = ctx or self._current_ctx
+        if not active_ctx:
+            return
+
+        from openviking.service.core import get_service
+
+        service = get_service()
+        if not service or not service.vikingdb_manager:
+            return
+
+        enqueued = 0
+        for uri in file_uris:
+            try:
+                content = await viking_fs.read_file(uri, ctx=active_ctx) or ""
+                if not content.strip():
+                    continue
+
+                parsed = parse_memory_file_with_fields(content)
+                abstract = parsed.get("content", "")
+
+                parent_uri = VikingURI(uri).parent.uri
+
+                memory_context = Context(
+                    uri=uri,
+                    parent_uri=parent_uri,
+                    is_leaf=True,
+                    abstract=abstract,
+                    context_type="memory",
+                    level=ContextLevel.DETAIL,
+                    user=active_ctx.user,
+                    account_id=active_ctx.account_id,
+                )
+                memory_context.set_vectorize(Vectorize(text=content))
+
+                embedding_msg = EmbeddingMsgConverter.from_context(memory_context)
+                if embedding_msg:
+                    await service.vikingdb_manager.enqueue_embedding_msg(embedding_msg)
+                    enqueued += 1
+
+            except Exception as e:
+                logger.warning(f"Failed to vectorize memory file {uri}: {e}")
+
+        if enqueued:
+            logger.info(f"Enqueued {enqueued} memory files for vectorization")
+
     async def _sync_topdown_recursive(
         self,
         root_uri: str,
