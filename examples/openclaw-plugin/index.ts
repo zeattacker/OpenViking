@@ -5,7 +5,7 @@ import { Type } from "@sinclair/typebox";
 import { memoryOpenVikingConfigSchema } from "./config.js";
 
 import { OpenVikingClient, localClientCache, localClientPendingPromises, isMemoryUri } from "./client.js";
-import type { FindResultItem, PendingClientEntry, CommitSessionResult, OVMessage } from "./client.js";
+import type { FindResult, FindResultItem, PendingClientEntry, CommitSessionResult, OVMessage } from "./client.js";
 import { formatMessageFaithful } from "./context-engine.js";
 import {
   compileSessionPatterns,
@@ -114,98 +114,36 @@ const AUTO_RECALL_TIMEOUT_MS = 5_000;
 // ── Session-start injection caches ──
 type SessionCache = { text: string; ts: number; sid: string };
 let _profileCache: SessionCache | null = null;
-let _toolExpCache: SessionCache | null = null;
 let _dirCache: SessionCache | null = null;
 
 /**
- * Aggregate tool/skill experience from all agent spaces via direct file reads.
- * Returns formatted summary of top tools by call count.
+ * Build tool-experience text from semantic search results.
+ * Only includes results above the score threshold.
  */
-async function aggregateToolExperience(
-  client: OpenVikingClient,
-  agentId: string | undefined,
-  _logger?: unknown,
-): Promise<string> {
-  // Map: toolName → { calls, bestFor[], watchOut[] }
-  const toolMap = new Map<string, { calls: number; bestFor: Set<string>; watchOut: Set<string> }>();
+function buildToolExperienceFromSearch(
+  toolsMemories: FindResultItem[],
+  skillsMemories: FindResultItem[],
+  scoreThreshold: number = 0.20,
+  limit: number = 5,
+): string {
+  const all = [...toolsMemories, ...skillsMemories];
+  const seen = new Set<string>();
+  const filtered = all
+    .filter((m) => (m.score ?? 0) >= scoreThreshold)
+    .filter((m) => {
+      if (seen.has(m.uri)) return false;
+      seen.add(m.uri);
+      return true;
+    })
+    .sort((a, b) => (b.score ?? 0) - (a.score ?? 0))
+    .slice(0, limit);
 
-  // List all agent spaces
-  let agentSpaces: Array<Record<string, unknown>> = [];
-  try {
-    agentSpaces = await client.listDirectory("viking://agent/", agentId);
-  } catch {
-    return "";
-  }
-
-  // For each agent space, scan tools/ and skills/ directories
-  for (const space of agentSpaces) {
-    const spaceName = String(space.name ?? "");
-    if (!spaceName || spaceName.startsWith(".") || spaceName === "_archive") continue;
-
-    for (const subdir of ["memories/tools", "memories/skills"]) {
-      let files: Array<Record<string, unknown>> = [];
-      try {
-        files = await client.listDirectory(`viking://agent/${spaceName}/${subdir}/`, agentId);
-      } catch {
-        continue;
-      }
-
-      for (const file of files) {
-        const name = String(file.name ?? "");
-        // Skip run-logs, hidden files, directories, archives
-        if (!name.endsWith(".md") || name.startsWith(".") || name.startsWith("run-")) continue;
-        if (file.isDir) continue;
-
-        const uri = String(file.uri ?? `viking://agent/${spaceName}/${subdir}/${name}`);
-        try {
-          const content = await client.read(uri, agentId);
-          if (!content) continue;
-
-          const toolName = name.replace(/\.md$/, "");
-          const callsMatch = content.match(/Based on (\d+) historical (?:calls|executions)/);
-          const calls = callsMatch ? parseInt(callsMatch[1], 10) : 0;
-          const bestForMatch = content.match(/Best for:\s*(.+?)(?:\n|$)/);
-          const watchOutMatch = content.match(/Common failures:\s*(.+?)(?:\n|$)/);
-
-          const entry = toolMap.get(toolName) ?? { calls: 0, bestFor: new Set(), watchOut: new Set() };
-          entry.calls += calls;
-          if (bestForMatch?.[1]) {
-            // Take first 2 items to keep it compact
-            bestForMatch[1].split(/[;,]/).slice(0, 2).forEach((s) => {
-              const trimmed = s.trim();
-              if (trimmed) entry.bestFor.add(trimmed);
-            });
-          }
-          if (watchOutMatch?.[1]) {
-            watchOutMatch[1].split(/[;,]/).slice(0, 2).forEach((s) => {
-              const trimmed = s.trim();
-              if (trimmed) entry.watchOut.add(trimmed);
-            });
-          }
-          toolMap.set(toolName, entry);
-        } catch {
-          continue;
-        }
-      }
-    }
-  }
-
-  if (toolMap.size === 0) return "";
-
-  // Sort by calls desc, take top 5
-  const sorted = [...toolMap.entries()]
-    .filter(([, v]) => v.calls > 0)
-    .sort((a, b) => b[1].calls - a[1].calls)
-    .slice(0, 5);
-
-  if (sorted.length === 0) return "";
-
-  return sorted
-    .map(([name, info]) => {
-      const lines = [`${name}: ${info.calls} calls`];
-      if (info.bestFor.size > 0) lines.push(`  Best for: ${[...info.bestFor].slice(0, 3).join("; ")}`);
-      if (info.watchOut.size > 0) lines.push(`  Watch out: ${[...info.watchOut].slice(0, 3).join("; ")}`);
-      return lines.join("\n");
+  if (filtered.length === 0) return "";
+  return filtered
+    .map((m) => {
+      const name = m.uri.split("/").pop()?.replace(".md", "") ?? "unknown";
+      const abstract = (m.abstract ?? "").trim().slice(0, 150);
+      return abstract ? `- [${name}] ${abstract}` : `- [${name}]`;
     })
     .join("\n");
 }
@@ -1021,35 +959,7 @@ const contextEnginePlugin = {
         }
       }
 
-      // ── Feature 2: Tool/Skill Experience (session start, cached) ──
-      if (cfg.recallToolExperience) {
-        const TOOL_EXP_TTL_MS = 30 * 60 * 1000;
-        const now = Date.now();
-        const sid = ctx?.sessionId ?? "";
-        if (
-          !_toolExpCache ||
-          _toolExpCache.sid !== sid ||
-          now - _toolExpCache.ts > TOOL_EXP_TTL_MS
-        ) {
-          try {
-            const text = await withTimeout(
-              aggregateToolExperience(client, agentId),
-              10000,
-              "openviking: tool experience aggregation timeout",
-            );
-            _toolExpCache = { text, ts: now, sid };
-          } catch {
-            _toolExpCache = { text: "", ts: now, sid };
-          }
-        }
-        if (_toolExpCache.text.trim()) {
-          prependContextParts.push(
-            `<tool-experience>\n${_toolExpCache.text.trim()}\n</tool-experience>`,
-          );
-        }
-      }
-
-      // ── Feature 3: Directory Structure Pre-inject (session start, cached) ──
+      // ── Feature 2: Directory Structure Pre-inject (session start, cached) ──
       if (cfg.directoryPreInject) {
         const DIR_TTL_MS = 30 * 60 * 1000;
         const now = Date.now();
@@ -1088,7 +998,12 @@ const contextEnginePlugin = {
             await withTimeout(
               (async () => {
                 const candidateLimit = Math.max(cfg.recallLimit * 4, 20);
-                const [userSettled, agentSettled] = await Promise.allSettled([
+
+                // 4 parallel searches: user memories, agent memories, agent tools, agent skills
+                const searchPromises: [
+                  Promise<FindResult>, Promise<FindResult>,
+                  Promise<FindResult>, Promise<FindResult>,
+                ] = [
                   client.find(queryText, {
                     targetUri: "viking://user/memories",
                     limit: candidateLimit,
@@ -1099,10 +1014,30 @@ const contextEnginePlugin = {
                     limit: candidateLimit,
                     scoreThreshold: 0,
                   }, agentId),
-                ]);
+                  ...(cfg.recallToolExperience ? [
+                    client.find(queryText, {
+                      targetUri: "viking://agent/memories/tools",
+                      limit: 10,
+                      scoreThreshold: 0,
+                    }, agentId),
+                    client.find(queryText, {
+                      targetUri: "viking://agent/memories/skills",
+                      limit: 10,
+                      scoreThreshold: 0,
+                    }, agentId),
+                  ] : [
+                    Promise.resolve({ memories: [] } as FindResult),
+                    Promise.resolve({ memories: [] } as FindResult),
+                  ]) as [Promise<FindResult>, Promise<FindResult>],
+                ];
+
+                const [userSettled, agentSettled, toolsSettled, skillsSettled] =
+                  await Promise.allSettled(searchPromises);
 
                 const userResult = userSettled.status === "fulfilled" ? userSettled.value : { memories: [] };
                 const agentResult = agentSettled.status === "fulfilled" ? agentSettled.value : { memories: [] };
+                const toolsResult = toolsSettled.status === "fulfilled" ? toolsSettled.value : { memories: [] };
+                const skillsResult = skillsSettled.status === "fulfilled" ? skillsSettled.value : { memories: [] };
                 if (userSettled.status === "rejected") {
                   api.logger.warn(`openviking: user memories search failed: ${String(userSettled.reason)}`);
                 }
@@ -1110,6 +1045,8 @@ const contextEnginePlugin = {
                   api.logger.warn(`openviking: agent memories search failed: ${String(agentSettled.reason)}`);
                 }
 
+                // Route 1: user + agent memories → <relevant-memories>
+                // (tools/skills excluded by pickMemoriesForInjection)
                 const allMemories = [...(userResult.memories ?? []), ...(agentResult.memories ?? [])];
                 const uniqueMemories = allMemories.filter((memory, index, self) =>
                   index === self.findIndex((m) => m.uri === memory.uri)
@@ -1145,6 +1082,24 @@ const contextEnginePlugin = {
                       `${memoryContext}\n` +
                     "</relevant-memories>",
                   );
+                }
+
+                // Route 2: tools + skills → <tool-experience> (semantic, per-query)
+                if (cfg.recallToolExperience) {
+                  const toolExpText = buildToolExperienceFromSearch(
+                    toolsResult.memories ?? [],
+                    skillsResult.memories ?? [],
+                    cfg.recallToolScoreThreshold,
+                    5,
+                  );
+                  if (toolExpText) {
+                    verboseRoutingInfo(
+                      `openviking: injecting tool-experience (${toolExpText.split("\n").length} items)`,
+                    );
+                    prependContextParts.push(
+                      `<tool-experience>\n${toolExpText}\n</tool-experience>`,
+                    );
+                  }
                 }
               })(),
               AUTO_RECALL_TIMEOUT_MS,

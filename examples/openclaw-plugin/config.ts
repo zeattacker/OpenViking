@@ -53,8 +53,10 @@ export type MemoryOpenVikingConfig = {
   phase2PollIntervalMs?: number;
   /** Phase2 memory extraction poll timeout in ms (default 120000). */
   phase2PollTimeoutMs?: number;
-  /** When true (default), aggregate tool/skill experience from all agents and inject at session start. */
+  /** When true (default), search tool/skill experience semantically per query and inject when relevant. */
   recallToolExperience?: boolean;
+  /** Minimum score for tool/skill experience to be injected (default 0.20). */
+  recallToolScoreThreshold?: number;
   /** When true (default), inject directory structure of available memories at session start. */
   directoryPreInject?: boolean;
   /** Ratio of context window at which to trigger background commit (0.1-0.9). Overrides commitTokenThreshold when set. */
@@ -71,11 +73,12 @@ const DEFAULT_TARGET_URI = "viking://user/memories";
 const DEFAULT_TIMEOUT_MS = 15000;
 const DEFAULT_CAPTURE_MODE = "semantic";
 const DEFAULT_CAPTURE_MAX_LENGTH = 24000;
-const DEFAULT_RECALL_LIMIT = 12;
-const DEFAULT_RECALL_SCORE_THRESHOLD = 0.10;
+const DEFAULT_RECALL_LIMIT = 8;
+const DEFAULT_RECALL_SCORE_THRESHOLD = 0.15;
 const DEFAULT_RECALL_MAX_CONTENT_CHARS = 500;
 const DEFAULT_RECALL_PREFER_ABSTRACT = true;
-const DEFAULT_RECALL_TOKEN_BUDGET = 4000;
+const DEFAULT_RECALL_TOKEN_BUDGET = 3000;
+const DEFAULT_RECALL_TOOL_SCORE_THRESHOLD = 0.20;
 const DEFAULT_COMMIT_TOKEN_THRESHOLD = 20000;
 const DEFAULT_INGEST_REPLY_ASSIST = true;
 const DEFAULT_INGEST_REPLY_ASSIST_MIN_SPEAKER_TURNS = 2;
@@ -211,6 +214,7 @@ export const memoryOpenVikingConfigSchema = {
         "phase2PollIntervalMs",
         "phase2PollTimeoutMs",
         "recallToolExperience",
+        "recallToolScoreThreshold",
         "directoryPreInject",
         "compactThreshold1Ratio",
         "compactThreshold2Ratio",
@@ -276,7 +280,7 @@ export const memoryOpenVikingConfigSchema = {
         Math.min(50000, Math.floor(toNumber(cfg.recallTokenBudget, DEFAULT_RECALL_TOKEN_BUDGET))),
       ),
       recallMultiTier: cfg.recallMultiTier === true,
-      recallUserRatio: Math.max(0, Math.min(1, toNumber(cfg.recallUserRatio, 0.6))),
+      recallUserRatio: Math.max(0, Math.min(1, toNumber(cfg.recallUserRatio, 0.7))),
       commitTokenThreshold: Math.max(
         0,
         Math.min(100_000, Math.floor(toNumber(cfg.commitTokenThreshold, DEFAULT_COMMIT_TOKEN_THRESHOLD))),
@@ -337,6 +341,10 @@ export const memoryOpenVikingConfigSchema = {
         Math.min(600_000, Math.floor(toNumber(cfg.phase2PollTimeoutMs, DEFAULT_PHASE2_POLL_TIMEOUT_MS))),
       ),
       recallToolExperience: cfg.recallToolExperience !== false,
+      recallToolScoreThreshold: Math.max(
+        0,
+        Math.min(1, toNumber(cfg.recallToolScoreThreshold, DEFAULT_RECALL_TOOL_SCORE_THRESHOLD)),
+      ),
       directoryPreInject: cfg.directoryPreInject !== false,
       compactThreshold1Ratio: typeof cfg.compactThreshold1Ratio === "number"
         ? Math.max(0.1, Math.min(0.9, cfg.compactThreshold1Ratio)) : undefined as unknown as number,

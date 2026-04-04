@@ -257,56 +257,59 @@ function dedupeAndRank(items: FindResultItem[], queryText: string): FindResultIt
 }
 
 /**
- * Multi-slot recall: allocate budget between user-space (search-ranked) and
- * agent-space (category-coverage) memories.
+ * Multi-slot recall: allocate budget between user-space and agent-space memories.
+ * Tools/skills are excluded — they are handled separately by <tool-experience>.
  *
- * Agent-space categories (patterns, tools, skills) each get at least 1 slot
- * when available.  Unused agent slots backfill to user-space.
+ * When userRatio >= 1.0, uses pure ranking (no budget split).
+ * When userRatio < 1.0, splits budget: user gets userRatio%, agent patterns get rest.
  */
 export function pickMemoriesForInjection(
   items: FindResultItem[],
   limit: number,
   queryText: string,
-  userRatio = 0.6,
+  userRatio = 0.7,
 ): FindResultItem[] {
   if (items.length === 0 || limit <= 0) {
     return [];
   }
 
-  // Exclude consolidated patterns (experimental, meta-knowledge not factual)
-  const eligible = items.filter((item) => !isConsolidatedPattern(item));
+  // Exclude consolidated patterns and tools/skills (handled by <tool-experience>)
+  const eligible = items
+    .filter((item) => !isConsolidatedPattern(item))
+    .filter((item) => {
+      const cat = getAgentCategory(item);
+      return cat !== "tools" && cat !== "skills";
+    });
   if (eligible.length === 0) {
     return [];
   }
 
-  // Split by space
+  // Pure ranking mode: no budget split, just rank everything together
+  if (userRatio >= 1.0) {
+    const ranked = dedupeAndRank(eligible, queryText);
+    const leaves = ranked.filter((i) => isLeafLikeMemory(i));
+    const nonLeaves = ranked.filter((i) => !isLeafLikeMemory(i));
+    return [...leaves, ...nonLeaves].slice(0, limit);
+  }
+
+  // Budget-split mode: separate user-space and agent-space
   const userItems: FindResultItem[] = [];
-  const agentByCategory = new Map<string, FindResultItem[]>();
+  const agentItems: FindResultItem[] = [];
   for (const item of eligible) {
     const cat = getAgentCategory(item);
     if (cat === null) {
       userItems.push(item);
     } else {
-      const list = agentByCategory.get(cat) ?? [];
-      list.push(item);
-      agentByCategory.set(cat, list);
+      agentItems.push(item);
     }
   }
 
-  // Budget allocation
-  // Tools/skills are injected at session start via <tool-experience>, not per-turn recall.
-  const agentCategories = ["patterns"];
-  const availableCategories = agentCategories.filter((c) => (agentByCategory.get(c)?.length ?? 0) > 0);
   const userBudget = Math.max(1, Math.floor(limit * userRatio));
   const agentBudget = limit - userBudget;
 
-  // Each available agent category gets at least 1 slot; remainder distributed by rank
-  const perCategoryMin = availableCategories.length > 0 ? Math.max(1, Math.floor(agentBudget / availableCategories.length)) : 0;
-
-  // Pick user-space (search-ranked)
+  // Pick user-space (search-ranked, leaf-preferred)
   const rankedUser = dedupeAndRank(userItems, queryText);
   const pickedUser = rankedUser.filter((i) => isLeafLikeMemory(i)).slice(0, userBudget);
-  // Backfill with non-leaf if needed
   if (pickedUser.length < userBudget) {
     const usedUris = new Set(pickedUser.map((i) => i.uri));
     for (const item of rankedUser) {
@@ -317,41 +320,22 @@ export function pickMemoriesForInjection(
     }
   }
 
-  // Pick agent-space (category-coverage)
-  const pickedAgent: FindResultItem[] = [];
-  for (const cat of availableCategories) {
-    const catItems = agentByCategory.get(cat) ?? [];
-    const ranked = dedupeAndRank(catItems, queryText);
-    const catSlots = Math.min(perCategoryMin, ranked.length);
-    for (let i = 0; i < catSlots; i++) {
-      pickedAgent.push(ranked[i]);
-    }
-  }
+  // Pick agent-space (patterns/cases only, tools/skills already excluded)
+  const rankedAgent = dedupeAndRank(agentItems, queryText);
+  const pickedAgent = rankedAgent.slice(0, agentBudget);
 
-  // Backfill unused agent slots to user-space or remaining agent items
+  // Backfill unused slots
   const totalPicked = pickedUser.length + pickedAgent.length;
   if (totalPicked < limit) {
     const usedUris = new Set([...pickedUser, ...pickedAgent].map((i) => i.uri));
-    // First backfill from remaining user items
     for (const item of rankedUser) {
       if (pickedUser.length + pickedAgent.length >= limit) break;
       if (usedUris.has(item.uri)) continue;
       pickedUser.push(item);
       usedUris.add(item.uri);
     }
-    // Then from remaining agent items (e.g. "other" category)
-    const allAgentRanked = dedupeAndRank(
-      [...agentByCategory.values()].flat(),
-      queryText,
-    );
-    for (const item of allAgentRanked) {
-      if (pickedUser.length + pickedAgent.length >= limit) break;
-      if (usedUris.has(item.uri)) continue;
-      pickedAgent.push(item);
-      usedUris.add(item.uri);
-    }
   }
 
-  // Merge: user first, then agent (preserves priority ordering)
+  // Merge: user first, then agent
   return [...pickedUser, ...pickedAgent].slice(0, limit);
 }
