@@ -7,7 +7,7 @@ description: |
   - Each episode summarizes ONE session commit (archive cycle).
   - Do NOT split a single session into multiple episodes.
 directory: "viking://user/{{ user_space }}/memories/episodes"
-filename_template: "ep_{{ session_id[:12] }}_{{ session_time }}.md"
+filename_template: "{{ date }}_{{ title_slug }}.md"
 enabled: true
 operation_mode: "add_only"
 

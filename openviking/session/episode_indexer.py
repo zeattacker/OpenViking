@@ -118,6 +118,36 @@ class EpisodeIndexer:
                 lines.append(f"[{role}]: {content}")
         return "\n\n".join(lines)
 
+    @staticmethod
+    def _extract_title_slug(episode_content: str, max_words: int = 6) -> str:
+        """Extract a filesystem-safe slug from the episode title.
+
+        Parses ``# Episode: <title>`` from the markdown content and converts
+        it to a lowercase underscore-separated slug (max *max_words* words).
+        Falls back to ``"episode"`` if no title is found.
+        """
+        title = ""
+        for line in episode_content.split("\n"):
+            line = line.strip()
+            if line.startswith("# Episode:"):
+                title = line.replace("# Episode:", "").strip()
+                break
+            elif line.startswith("# ") and not title:
+                title = line.lstrip("# ").strip()
+                break
+
+        if not title:
+            return "episode"
+
+        # Remove non-alphanumeric chars (keep spaces), lowercase, truncate
+        slug = re.sub(r"[^\w\s-]", "", title.lower())
+        slug = re.sub(r"[\s-]+", "_", slug).strip("_")
+        # Limit to max_words
+        parts = slug.split("_")[:max_words]
+        slug = "_".join(parts)
+        # Ensure not too long for filesystem
+        return slug[:80] if slug else "episode"
+
     async def _find_similar_episode(
         self,
         episode_content: str,
@@ -338,11 +368,11 @@ class EpisodeIndexer:
 
         # --- No duplicate found or score too low: create new episode ---
 
-        # Build episode URI
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
-        session_prefix = (session_id or "unknown")[:12]
+        # Build episode URI with human-readable filename: {date}_{title_slug}.md
+        date_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        title_slug = self._extract_title_slug(episode_content)
         user_space = user.user_space_name() if user else "default"
-        episode_filename = f"ep_{session_prefix}_{timestamp}.md"
+        episode_filename = f"{date_str}_{title_slug}.md"
         episode_uri = f"viking://user/{user_space}/memories/episodes/{episode_filename}"
         parent_uri = f"viking://user/{user_space}/memories/episodes"
 
