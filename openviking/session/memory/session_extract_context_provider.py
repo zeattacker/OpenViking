@@ -100,6 +100,10 @@ class SessionExtractContextProvider(ExtractContextProvider):
             mt = schema.memory_type
             if mt in seen:
                 continue
+            if mt == "episodes":
+                # Episodes are generated as a separate post-extraction step,
+                # not inside the ReAct loop.
+                continue
             seen.add(mt)
             if mt in self._EXTRACTION_QUESTIONS:
                 question, guidance = self._EXTRACTION_QUESTIONS[mt]
@@ -300,6 +304,9 @@ Before finalizing: review your reasoning. If you identified facts, people, or ev
 
         for schema in schemas:
             if not schema.directory:
+                continue
+            if schema.memory_type == "episodes":
+                # Episodes are generated separately, skip prefetch
                 continue
 
             # Replace variables in directory path with actual user/agent space

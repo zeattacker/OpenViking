@@ -1,0 +1,39 @@
+memory_type: episodes
+description: |
+  # Guidelines
+  - Session-level narrative summaries capturing the full conversation flow.
+  - Generated as a separate post-extraction step, not inside the ReAct loop.
+  - Episodes capture: what was discussed, decisions made, entities involved, and unresolved items.
+  - Each episode summarizes ONE session commit (archive cycle).
+  - Do NOT split a single session into multiple episodes.
+directory: "viking://user/{{ user_space }}/memories/episodes"
+filename_template: "ep_{{ session_id[:12] }}_{{ session_time }}.md"
+enabled: true
+operation_mode: "add_only"
+
+fields:
+  - name: episode_title
+    type: string
+    description: |
+      Descriptive title for the episode, summarizing the main topic.
+      Example: "Database Migration Planning Session"
+    merge_op: immutable
+
+  - name: session_id
+    type: string
+    description: |
+      Original session identifier (first 12 chars of UUID).
+    merge_op: immutable
+
+  - name: session_time
+    type: string
+    description: |
+      Session timestamp in YYYYMMDDTHHMMSS format.
+    merge_op: immutable
+
+  - name: content
+    type: string
+    description: |
+      Full episode markdown content with structured sections:
+      Summary, Key Topics, Decisions & Outcomes, Entities Mentioned, Unresolved Items.
+    merge_op: patch

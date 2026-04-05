@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0
 from typing import Any, Dict, List
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class TrivialFilterConfig(BaseModel):
@@ -46,6 +46,71 @@ class TrivialFilterConfig(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+class EpisodeConfig(BaseModel):
+    """Configuration for episodic memory generation.
+
+    Controls session-level narrative summary generation that runs as a
+    separate post-extraction step after the v2 ReAct memory loop.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description="Enable episode generation during memory extraction",
+    )
+    dedup_skip_threshold: float = Field(
+        default=0.92,
+        description=(
+            "Cosine similarity threshold at or above which a near-duplicate "
+            "episode is skipped entirely."
+        ),
+    )
+    dedup_evolve_threshold: float = Field(
+        default=0.75,
+        description=(
+            "Cosine similarity threshold at or above which an existing episode "
+            "is evolved (new content appended as a follow-up)."
+        ),
+    )
+    min_messages: int = Field(
+        default=2,
+        description="Minimum message count required to trigger episode generation",
+    )
+
+    model_config = {"extra": "forbid"}
+
+    @model_validator(mode="after")
+    def validate_thresholds(self) -> "EpisodeConfig":
+        if self.dedup_evolve_threshold >= self.dedup_skip_threshold:
+            raise ValueError(
+                "episodes.dedup_evolve_threshold must be less than "
+                "episodes.dedup_skip_threshold"
+            )
+        return self
+
+
+class RecallConfig(BaseModel):
+    """Configuration for memory recall ranking.
+
+    Controls category-based score boosts applied during retrieval so that
+    different memory types (episodic, semantic, procedural) are ranked
+    appropriately for the query context.
+    """
+
+    category_boosts: Dict[str, float] = Field(
+        default_factory=lambda: {
+            "episodes": 0.15,
+            "events": 0.05,
+        },
+        description=(
+            "Category-based multiplicative score boosts for memory recall ranking. "
+            "Positive values boost, negative values demote. "
+            "Categories not listed default to 0.0 (no boost)."
+        ),
+    )
+
+    model_config = {"extra": "forbid"}
+
+
 class MemoryConfig(BaseModel):
     """Memory configuration for OpenViking."""
 
@@ -69,6 +134,16 @@ class MemoryConfig(BaseModel):
     trivial_filter: TrivialFilterConfig = Field(
         default_factory=TrivialFilterConfig,
         description="Filter trivial/automated sessions (heartbeats, cron jobs) from memory extraction",
+    )
+
+    episodes: EpisodeConfig = Field(
+        default_factory=EpisodeConfig,
+        description="Episodic memory generation settings (session-level narrative summaries)",
+    )
+
+    recall: RecallConfig = Field(
+        default_factory=RecallConfig,
+        description="Memory recall ranking settings (category-based score boosts)",
     )
 
     model_config = {"extra": "forbid"}

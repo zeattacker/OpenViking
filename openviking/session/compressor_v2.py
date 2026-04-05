@@ -251,6 +251,62 @@ class SessionCompressorV2:
                     )
                 )
 
+            # --- Episode generation (separate LLM call, post-extraction) ---
+            try:
+                config = get_openviking_config()
+                ep_config = config.memory.episodes
+                ep_registry = orchestrator.context_provider._get_registry()
+                ep_schema = ep_registry.get("episodes")
+                if ep_config.enabled and ep_schema and ep_schema.enabled:
+                    from openviking.session.episode_indexer import EpisodeIndexer
+
+                    episode_indexer = EpisodeIndexer(vikingdb=self.vikingdb)
+                    with telemetry.measure("memory.extract.stage.episode_generation"):
+                        episode = await episode_indexer.generate_episode(
+                            messages, user, session_id, ctx
+                        )
+                    if episode:
+                        # Vectorize the episode
+                        from openviking.storage.queuefs.semantic_queue import (
+                            get_semantic_queue,
+                        )
+
+                        queue = get_semantic_queue()
+                        if queue:
+                            await queue.enqueue_vectorize(episode, ctx=ctx)
+
+                        contexts.append(
+                            Context(
+                                uri=episode.uri,
+                                category="episode",
+                                context_type="memory",
+                            )
+                        )
+
+                        # Cross-memory linking: link episode to co-extracted memories
+                        co_extracted = result.written_uris + result.edited_uris
+                        if co_extracted:
+                            viking_fs_link = get_viking_fs()
+                            if viking_fs_link:
+                                try:
+                                    await viking_fs_link.link(
+                                        episode.uri,
+                                        co_extracted,
+                                        reason="Episode co-extracted with these memories",
+                                        ctx=ctx,
+                                    )
+                                except Exception as link_err:
+                                    logger.debug(
+                                        "Episode cross-link failed (non-fatal): %s",
+                                        link_err,
+                                    )
+
+                        logger.info("Episode indexed: %s", episode.uri)
+            except Exception as ep_err:
+                logger.error(
+                    "Episode generation failed (non-fatal): %s", ep_err, exc_info=True
+                )
+
             return contexts
 
         except Exception as e:

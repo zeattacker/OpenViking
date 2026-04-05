@@ -51,6 +51,12 @@ class HierarchicalRetriever:
     GLOBAL_SEARCH_TOPK = 10  # Global retrieval count (more candidates = better rerank precision)
     HOTNESS_ALPHA = 0.2  # Weight for hotness score in final ranking (0 = disabled)
     LEVEL_URI_SUFFIX = {0: ".abstract.md", 1: ".overview.md"}
+    # Default category-based score boosts for memory recall ranking.
+    # Overridden by config.memory.recall.category_boosts when available.
+    DEFAULT_CATEGORY_BOOSTS = {
+        "episodes": 0.15,
+        "events": 0.05,
+    }
 
     def __init__(
         self,
@@ -554,6 +560,12 @@ class HierarchicalRetriever:
             final_score = (1 - alpha) * semantic_score + alpha * h_score
             if not math.isfinite(final_score):
                 final_score = 0.0
+
+            # --- category-aware boost ---
+            category = c.get("category", "")
+            category_boost = self._get_category_boost(category)
+            final_score = final_score * (1.0 + category_boost)
+
             level = c.get("level", 2)
             display_uri = self._append_level_suffix(c.get("uri", ""), level)
 
@@ -589,6 +601,21 @@ class HierarchicalRetriever:
             uri = uri.rstrip("/")
         return f"{uri}/{suffix}"
 
+    def _get_category_boost(self, category: str) -> float:
+        """Return multiplicative score boost for a memory category.
+
+        Reads from config.memory.recall.category_boosts when available,
+        falls back to DEFAULT_CATEGORY_BOOSTS.
+        """
+        try:
+            from openviking_cli.utils.config import get_openviking_config
+
+            config = get_openviking_config()
+            boosts = config.memory.recall.category_boosts
+        except Exception:
+            boosts = self.DEFAULT_CATEGORY_BOOSTS
+        return boosts.get(category, 0.0)
+
     def _get_root_uris_for_type(
         self, context_type: Optional[ContextType], ctx: Optional[RequestContext] = None
     ) -> List[str]:
@@ -605,7 +632,8 @@ class HierarchicalRetriever:
         if context_type is None:
             return [
                 f"viking://user/{user_space}/memories",
-                f"viking://user/{user_space}/episodes",
+                f"viking://user/{user_space}/memories/episodes",
+                f"viking://user/{user_space}/episodes",  # legacy v1 path
                 f"viking://agent/{agent_space}/memories",
                 "viking://resources",
                 f"viking://agent/{agent_space}/skills",
@@ -613,7 +641,8 @@ class HierarchicalRetriever:
         elif context_type == ContextType.MEMORY:
             return [
                 f"viking://user/{user_space}/memories",
-                f"viking://user/{user_space}/episodes",
+                f"viking://user/{user_space}/memories/episodes",
+                f"viking://user/{user_space}/episodes",  # legacy v1 path
                 f"viking://agent/{agent_space}/memories",
             ]
         elif context_type == ContextType.RESOURCE:

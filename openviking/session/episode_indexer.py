@@ -8,6 +8,7 @@ as searchable episodes alongside existing memories.
 Includes score-based dedup to prevent near-duplicate episodes.
 """
 
+import re
 from datetime import datetime, timezone
 from typing import List, Optional
 
@@ -21,11 +22,6 @@ from openviking_cli.utils import get_logger
 from openviking_cli.utils.config import get_openviking_config
 
 logger = get_logger(__name__)
-
-# Score-based episode dedup thresholds (no LLM needed).
-# Derived from empirical pairwise tests on known duplicate/non-duplicate memories.
-EPISODE_SKIP_THRESHOLD = 0.92   # Near-exact duplicate conversation → skip
-EPISODE_EVOLVE_THRESHOLD = 0.75  # Same topic, new details → evolve (append)
 
 
 class EpisodeIndexer:
@@ -58,7 +54,6 @@ class EpisodeIndexer:
     _TRIVIAL_PATTERNS = [
         "heartbeat",
         "heartbeat_ok",
-        "heartteat_ok",
         "health check",
         "health_check",
         "system check",
@@ -90,9 +85,10 @@ class EpisodeIndexer:
 
         text_lower = formatted_messages.lower()
 
-        # Check for trivial keyword patterns
+        # Check for trivial keyword patterns (word-boundary match to avoid
+        # false positives like "ping" matching inside "shopping").
         for pattern in patterns:
-            if pattern.lower() in text_lower:
+            if re.search(r"\b" + re.escape(pattern.lower()) + r"\b", text_lower):
                 return True
 
         # Very short conversations with minimal content
@@ -145,7 +141,7 @@ class EpisodeIndexer:
             query_vector = embed_result.dense_vector
 
             user_space = user.user_space_name() if user else "default"
-            episodes_prefix = f"viking://user/{user_space}/episodes/"
+            episodes_prefix = f"viking://user/{user_space}/memories/episodes/"
 
             conds = [
                 Eq("level", 2),
@@ -252,9 +248,19 @@ class EpisodeIndexer:
         if not messages or not ctx:
             return None
 
+        # Read episode config for enabled check and thresholds
+        config = get_openviking_config()
+        ep_config = config.memory.episodes
+        if not ep_config.enabled:
+            logger.debug("Skipping episode generation: disabled in config")
+            return None
+
         message_count = len(messages)
-        if message_count < 2:
-            logger.debug("Skipping episode generation: fewer than 2 messages")
+        if message_count < ep_config.min_messages:
+            logger.debug(
+                "Skipping episode generation: fewer than %d messages",
+                ep_config.min_messages,
+            )
             return None
 
         formatted_messages = self._format_messages(messages)
@@ -309,20 +315,23 @@ class EpisodeIndexer:
         episode_content = episode_content.strip()
 
         # --- Episode dedup: score-based, no LLM needed ---
+        skip_threshold = ep_config.dedup_skip_threshold
+        evolve_threshold = ep_config.dedup_evolve_threshold
+
         similar_ep, score = await self._find_similar_episode(
             episode_content, user, ctx,
         )
-        if similar_ep and score >= EPISODE_SKIP_THRESHOLD:
+        if similar_ep and score >= skip_threshold:
             logger.info(
                 "Episode dedup: SKIP (score=%.4f >= %.2f) similar=%s",
-                score, EPISODE_SKIP_THRESHOLD, similar_ep.uri,
+                score, skip_threshold, similar_ep.uri,
             )
             return None
 
-        if similar_ep and score >= EPISODE_EVOLVE_THRESHOLD:
+        if similar_ep and score >= evolve_threshold:
             logger.info(
                 "Episode dedup: EVOLVE (score=%.4f >= %.2f) into=%s",
-                score, EPISODE_EVOLVE_THRESHOLD, similar_ep.uri,
+                score, evolve_threshold, similar_ep.uri,
             )
             evolved = await self._evolve_episode(similar_ep, episode_content, ctx)
             return evolved  # May be None on failure; caller handles it
@@ -334,8 +343,8 @@ class EpisodeIndexer:
         session_prefix = (session_id or "unknown")[:12]
         user_space = user.user_space_name() if user else "default"
         episode_filename = f"ep_{session_prefix}_{timestamp}.md"
-        episode_uri = f"viking://user/{user_space}/episodes/{episode_filename}"
-        parent_uri = f"viking://user/{user_space}/episodes"
+        episode_uri = f"viking://user/{user_space}/memories/episodes/{episode_filename}"
+        parent_uri = f"viking://user/{user_space}/memories/episodes"
 
         # Write episode file
         viking_fs = get_viking_fs()

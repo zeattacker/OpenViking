@@ -179,15 +179,16 @@ class DistillationScheduler:
                             result.archived,
                             scope,
                         )
-                    # Decay episodes
-                    episodes_uri = f"{scope}/episodes/"
-                    result = await self._archiver.scan_and_archive(episodes_uri, ctx=ctx)
-                    if result.archived > 0:
-                        logger.info(
-                            "[DistillationScheduler] Archived %d cold episodes for %s",
-                            result.archived,
-                            scope,
-                        )
+                    # Decay episodes (v2 path + legacy path)
+                    for ep_path in [f"{scope}/memories/episodes/", f"{scope}/episodes/"]:
+                        result = await self._archiver.scan_and_archive(ep_path, ctx=ctx)
+                        if result.archived > 0:
+                            logger.info(
+                                "[DistillationScheduler] Archived %d cold episodes for %s (%s)",
+                                result.archived,
+                                scope,
+                                ep_path,
+                            )
             except Exception as e:
                 logger.error(
                     "[DistillationScheduler] Decay cycle error: %s", e, exc_info=True
@@ -290,7 +291,10 @@ class DistillationScheduler:
 
         scopes = await self._get_user_scopes()
         # Memory subdirectories + episodes
-        subdirs = ["memories/entities", "memories/events", "memories/preferences", "episodes"]
+        subdirs = [
+            "memories/entities", "memories/events", "memories/preferences",
+            "memories/episodes", "episodes",
+        ]
 
         for scope in scopes:
             for subdir in subdirs:
@@ -393,6 +397,7 @@ class DistillationScheduler:
                         f"{scope}/memories/cases/_archive",
                         f"{scope}/memories/patterns/_archive",
                         f"{scope}/memories/preferences/_archive",
+                        f"{scope}/memories/episodes/_archive",
                         f"{scope}/episodes/_archive",
                     ]
                     for archive_dir in archive_dirs:
@@ -484,7 +489,8 @@ class DistillationScheduler:
                     for subdir in [
                         "memories/entities", "memories/events",
                         "memories/preferences", "memories/patterns",
-                        "memories/cases", "episodes", "skills",
+                        "memories/cases", "memories/episodes",
+                        "episodes", "skills",
                     ]:
                         dir_uri = f"{scope}/{subdir}"
                         try:
