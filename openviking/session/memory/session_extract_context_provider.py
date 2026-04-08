@@ -127,14 +127,28 @@ For each conversation, ask yourself these questions and create memories for ever
 
 {checklist}
 
-## Decision Rules
+## Critical Rules
 
-- If the conversation contains factual information about the world → extract it
-- If the conversation reveals something about the user → extract it
-- If the conversation records an event or decision → extract it
-- If a problem was solved or a workflow was established → extract it
-- If you identified information in your reasoning but then wrote empty arrays → you made a mistake. Go back and create entries.
-- The only valid reason for empty output is a conversation with zero substantive content (e.g., only greetings with no information exchanged)
+### Consolidation (MOST IMPORTANT)
+- Read the pre-fetched overview files and search results FIRST. They list the entities, events, and preferences that already exist in memory.
+- If the conversation mentions an entity (person, project, organization, system) that already has a card, EDIT that existing card with the new information. Do NOT create a second card for the same entity.
+- Same entity = same card. One person with multiple names (nickname, full name, username) gets ONE card with aliases — not multiple cards.
+- Only create a new entity card when the entity is genuinely new (not in the overview or search results).
+
+### Speaker Attribution
+- Track which speaker said or did what. NEVER attribute one person's actions or facts to another.
+- If person A says "I deployed the API", that fact belongs in A's entity/profile, not in B's.
+
+### Date & Time Extraction
+- For events, extract dates explicitly from conversation text when present.
+- Convert relative dates to absolute using the session date provided above (e.g., "last Saturday" becomes the specific date based on the session's date).
+- Include the date in the event's `date` field when the event is time-sensitive. Leave it empty only if no date can be determined.
+
+### Honest Extraction
+- Extract what was actually said or clearly implied. Do NOT speculate, infer, or fabricate details that were not in the conversation.
+- If a fact is ambiguous, either skip it or mark it as uncertain in the content — do NOT invent details to fill gaps.
+- If you identified a fact in your reasoning but wrote empty output arrays, you made a mistake — go back and create the entries from your reasoning.
+- Empty output is only valid for conversations with no substantive content (pure greetings, test messages, pings, heartbeats).
 
 ## Workflow
 1. Analyze the conversation and the pre-fetched .overview.md files (already provided below)
@@ -162,7 +176,7 @@ After writing new memories, you MUST also update the corresponding .overview.md 
 ## Overview Format
 Two options:
 1. **PREFERRED: Direct string** - Just provide the complete new overview content:
-   {{"memory_type": "events", "overview": "# Events Overview\n- [event1](event1.md) - Description"}}
+   {{"memory_type": "events", "overview": "# Events Overview\\n- [event1](event1.md) - Description"}}
 2. **SEARCH/REPLACE** - Only use if you must modify a small portion:
    {{"memory_type": "events", "overview": {{"blocks": [{{"search": "exact line to change", "replace": "new line"}}]}}}}
 
@@ -209,6 +223,39 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
 
 Before finalizing: review your reasoning. If you identified facts, people, or events but your output arrays are empty, you have a contradiction — go back and create the entries.""",
         }
+
+    def _derive_search_keywords(self) -> str:
+        """Derive a semantic search query from the current conversation.
+
+        Used by prefetch() to find EXISTING related memories so the extractor
+        can EDIT them rather than create duplicates. Prefer user-role content
+        (what the human actually said) and cap length to fit embedder input.
+
+        Returns empty string if messages are unavailable, which makes prefetch
+        skip the per-directory search — the overview.md files are still shown.
+        """
+        if not isinstance(self.messages, list) or not self.messages:
+            return ""
+
+        user_texts: List[str] = []
+        all_texts: List[str] = []
+        for msg in self.messages:
+            content = getattr(msg, "content", "") or ""
+            if not content:
+                continue
+            role = getattr(msg, "role", "")
+            stripped = content.strip()
+            all_texts.append(stripped)
+            if role == "user":
+                user_texts.append(stripped)
+
+        picked = user_texts or all_texts
+        if not picked:
+            return ""
+        joined = " ".join(picked)
+        # Cap at 2000 chars — enough topic signal for the embedder, stays
+        # under typical 8k-token input budgets even with other prompt context.
+        return joined[:2000]
 
     def _assemble_conversation(self, messages: Any) -> str:
         """Assemble conversation string from messages.
@@ -362,8 +409,16 @@ Before finalizing: review your reasoning. If you identified facts, people, or ev
             except Exception as e:
                 logger.warning(f"Failed to read .overview.md: {e}")
 
+        # Derive search query ONCE from current conversation so the prefetch
+        # returns memories actually relevant to this session. Fixes a long-
+        # standing bug where the literal placeholder "[Keywords]" was passed
+        # as the query, making prefetch return random memories and causing
+        # the extractor to create duplicate entities instead of editing.
+        search_keywords = self._derive_search_keywords()
+        query_log = (search_keywords[:200] + "…") if len(search_keywords) > 200 else search_keywords
+
         # 在每个之前 ls 的目录内执行 search（替换原来的 ls 操作）
-        if search_tool and viking_fs and ls_dirs:
+        if search_tool and viking_fs and ls_dirs and search_keywords:
             for dir_uri in ls_dirs:
                 # 创建只在该目录搜索的 tool_ctx
                 tool_ctx_dir = ToolContext(
@@ -375,7 +430,7 @@ Before finalizing: review your reasoning. If you identified facts, people, or ev
                     search_result = await search_tool.execute(
                         viking_fs=viking_fs,
                         ctx=tool_ctx_dir,
-                        query="[Keywords]",
+                        query=search_keywords,
                     )
                     # 处理搜索结果
                     if isinstance(search_result, list):
@@ -394,7 +449,7 @@ Before finalizing: review your reasoning. If you identified facts, people, or ev
                         messages=pre_fetch_messages,
                         call_id=call_id_seq,
                         tool_name="search",
-                        params={"query": "[Keywords]", "search_uri": dir_uri},
+                        params={"query": query_log, "search_uri": dir_uri},
                         result=result_value,
                     )
                     call_id_seq += 1
