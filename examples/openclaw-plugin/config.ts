@@ -61,6 +61,12 @@ export type MemoryOpenVikingConfig = {
   recallToolScoreThreshold?: number;
   /** When true (default), inject directory structure of available memories at session start. */
   directoryPreInject?: boolean;
+  /** When true (default), read .pinned manifests and inject listed files at session start. */
+  pinnedContextInjection?: boolean;
+  /** Maximum total characters for all pinned content combined (default 4000). */
+  pinnedContextBudgetChars?: number;
+  /** When true (default), include viking://resources/ in auto-recall semantic search. */
+  recallResources?: boolean;
   /** Ratio of context window at which to trigger background commit (0.1-0.9). Overrides commitTokenThreshold when set. */
   compactThreshold1Ratio?: number;
   /** Ratio of context window at which to force commit (0.1-0.9). Must be > compactThreshold1Ratio. */
@@ -77,9 +83,9 @@ const DEFAULT_CAPTURE_MODE = "semantic";
 const DEFAULT_CAPTURE_MAX_LENGTH = 24000;
 const DEFAULT_RECALL_LIMIT = 8;
 const DEFAULT_RECALL_SCORE_THRESHOLD = 0.15;
-const DEFAULT_RECALL_MAX_CONTENT_CHARS = 500;
-const DEFAULT_RECALL_PREFER_ABSTRACT = true;
-const DEFAULT_RECALL_TOKEN_BUDGET = 3000;
+const DEFAULT_RECALL_MAX_CONTENT_CHARS = 2000;
+const DEFAULT_RECALL_PREFER_ABSTRACT = false;
+const DEFAULT_RECALL_TOKEN_BUDGET = 6000;
 const DEFAULT_RECALL_TOOL_SCORE_THRESHOLD = 0.20;
 const DEFAULT_COMMIT_TOKEN_THRESHOLD = 20000;
 const DEFAULT_BYPASS_SESSION_PATTERNS: string[] = [];
@@ -97,6 +103,9 @@ const DEFAULT_ALIGNMENT = {
   driftAlertThreshold: 0.65,
   driftConsecutiveFlagLimit: 5,
 };
+const DEFAULT_PINNED_CONTEXT_INJECTION = true;
+const DEFAULT_PINNED_CONTEXT_BUDGET_CHARS = 4000;
+const DEFAULT_RECALL_RESOURCES = true;
 const DEFAULT_EMIT_STANDARD_DIAGNOSTICS = false;
 const DEFAULT_PHASE2_POLL_INTERVAL_MS = 800;
 const DEFAULT_PHASE2_POLL_TIMEOUT_MS = 120_000;
@@ -220,6 +229,9 @@ export const memoryOpenVikingConfigSchema = {
         "recallToolExperience",
         "recallToolScoreThreshold",
         "directoryPreInject",
+        "pinnedContextInjection",
+        "pinnedContextBudgetChars",
+        "recallResources",
         "compactThreshold1Ratio",
         "compactThreshold2Ratio",
         "contextWindowSize",
@@ -357,6 +369,11 @@ export const memoryOpenVikingConfigSchema = {
         Math.min(1, toNumber(cfg.recallToolScoreThreshold, DEFAULT_RECALL_TOOL_SCORE_THRESHOLD)),
       ),
       directoryPreInject: cfg.directoryPreInject !== false,
+      pinnedContextInjection: cfg.pinnedContextInjection !== false,
+      pinnedContextBudgetChars: Math.max(
+        200, Math.min(20000, Math.floor(toNumber(cfg.pinnedContextBudgetChars, DEFAULT_PINNED_CONTEXT_BUDGET_CHARS))),
+      ),
+      recallResources: cfg.recallResources !== false,
       compactThreshold1Ratio: typeof cfg.compactThreshold1Ratio === "number"
         ? Math.max(0.1, Math.min(0.9, cfg.compactThreshold1Ratio)) : undefined as unknown as number,
       compactThreshold2Ratio: typeof cfg.compactThreshold2Ratio === "number"

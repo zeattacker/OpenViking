@@ -113,10 +113,85 @@ const MAX_OPENVIKING_STDERR_CHARS = 256_000;
 const AUTO_RECALL_TIMEOUT_MS = 5_000;
 const RECALL_QUERY_MAX_CHARS = 4_000;
 
+// ── 1-hop entity expansion ──
+const ENTITY_LINK_RE = /\[([^\]]+)\]\(([^)]+\.md)\)/g;
+
+/**
+ * Scan recalled memory content for entity links and fetch linked entities
+ * that are not already in the result set. Caps at `maxExpand` extra entities.
+ */
+async function expandEntityLinks(
+  memories: FindResultItem[],
+  client: OpenVikingClient,
+  agentId: string,
+  maxExpand = 3,
+): Promise<FindResultItem[]> {
+  if (memories.length === 0 || maxExpand <= 0) return [];
+
+  const existingUris = new Set(memories.map((m) => m.uri));
+  const linkedUris = new Set<string>();
+
+  for (const mem of memories) {
+    // Read content to find entity links
+    let content: string;
+    try {
+      content = await client.read(mem.uri, agentId);
+    } catch {
+      continue;
+    }
+    if (!content) continue;
+
+    // Extract entity links: [name](filename.md)
+    let match: RegExpExecArray | null;
+    ENTITY_LINK_RE.lastIndex = 0;
+    while ((match = ENTITY_LINK_RE.exec(content)) !== null) {
+      const linkedFile = match[2];
+      // Resolve relative link to entity URI based on the memory's URI
+      const memDir = mem.uri.substring(0, mem.uri.lastIndexOf("/"));
+      const parentDir = memDir.substring(0, memDir.lastIndexOf("/"));
+      // Links like "../entities/name.md" or "name.md" (same dir)
+      let entityUri: string;
+      if (linkedFile.startsWith("../")) {
+        entityUri = `${parentDir}/${linkedFile.replace("../", "")}`;
+      } else if (linkedFile.includes("/")) {
+        entityUri = `${parentDir}/${linkedFile}`;
+      } else {
+        // Same directory (e.g., entity linking to sibling entity)
+        entityUri = `${memDir}/${linkedFile}`;
+      }
+      if (!existingUris.has(entityUri)) {
+        linkedUris.add(entityUri);
+      }
+    }
+    if (linkedUris.size >= maxExpand) break;
+  }
+
+  // Fetch linked entities (cap at maxExpand)
+  const expanded: FindResultItem[] = [];
+  for (const uri of [...linkedUris].slice(0, maxExpand)) {
+    try {
+      const content = await client.read(uri, agentId);
+      if (content && typeof content === "string" && content.trim()) {
+        expanded.push({
+          uri,
+          level: 2,
+          score: 0.5,
+          abstract: content.trim().slice(0, 200),
+          category: "entities",
+        } as FindResultItem);
+      }
+    } catch {
+      // Entity doesn't exist — skip
+    }
+  }
+  return expanded;
+}
+
 // ── Session-start injection caches ──
 type SessionCache = { text: string; ts: number; sid: string };
 let _profileCache: SessionCache | null = null;
 let _dirCache: SessionCache | null = null;
+let _pinnedCache: SessionCache | null = null;
 
 /**
  * Build tool-experience text from semantic search results.
@@ -162,6 +237,8 @@ async function buildDirectoryListing(
   for (const [label, uri] of [
     ["user/memories", "viking://user/memories/"],
     ["agent/memories", "viking://agent/memories/"],
+    ["agent/instructions", "viking://agent/instructions/"],
+    ["resources", "viking://resources/"],
   ] as const) {
     try {
       const entries = await client.listDirectory(uri, agentId);
@@ -190,6 +267,66 @@ async function buildDirectoryListing(
   }
 
   return parts.join("\n");
+}
+
+/**
+ * Parse a .pinned manifest: one URI per line, # comments, blank lines ignored.
+ */
+function parsePinnedManifest(raw: string): string[] {
+  return raw.split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#"));
+}
+
+/**
+ * Read all .pinned manifests across scopes, then read each listed URI,
+ * concatenating content up to budgetChars.
+ */
+async function buildPinnedContext(
+  client: OpenVikingClient,
+  agentId: string | undefined,
+  budgetChars: number,
+): Promise<string> {
+  const MANIFEST_URIS = [
+    "viking://user/memories/.pinned",
+    "viking://agent/instructions/.pinned",
+    "viking://resources/.pinned",
+  ];
+
+  const manifestResults = await Promise.allSettled(
+    MANIFEST_URIS.map((uri) => client.read(uri, agentId)),
+  );
+
+  const allUris: string[] = [];
+  for (const result of manifestResults) {
+    if (result.status === "fulfilled" && result.value) {
+      allUris.push(...parsePinnedManifest(result.value));
+    }
+  }
+  if (allUris.length === 0) return "";
+
+  const seen = new Set<string>();
+  const uniqueUris = allUris.filter((uri) => {
+    if (seen.has(uri)) return false;
+    seen.add(uri);
+    return true;
+  });
+
+  let remaining = budgetChars;
+  const parts: string[] = [];
+  for (const uri of uniqueUris) {
+    if (remaining <= 0) break;
+    try {
+      const content = await client.read(uri, agentId);
+      const trimmed = content.trim();
+      if (!trimmed) continue;
+      const truncated = trimmed.slice(0, remaining);
+      const label = uri.split("/").pop() ?? uri;
+      parts.push(`[${label}]\n${truncated}`);
+      remaining -= truncated.length;
+    } catch {
+      continue;
+    }
+  }
+  return parts.join("\n\n");
 }
 
 /**
@@ -597,7 +734,14 @@ const contextEnginePlugin = {
             limit,
             scoreThreshold,
           });
-          if (memories.length === 0) {
+
+          // 1-hop entity expansion: read recalled memories, follow entity links
+          const expandedMemories = await expandEntityLinks(
+            memories, recallClient, agentId, 3,
+          );
+
+          const allMemories = [...memories, ...expandedMemories];
+          if (allMemories.length === 0) {
             return {
               content: [{ type: "text", text: "No relevant OpenViking memories found." }],
               details: { count: 0, total: result.total ?? 0, scoreThreshold },
@@ -607,13 +751,13 @@ const contextEnginePlugin = {
             content: [
               {
                 type: "text",
-                text: `Found ${memories.length} memories:\n\n${formatMemoryLines(memories)}`,
+                text: `Found ${allMemories.length} memories:\n\n${formatMemoryLines(allMemories)}`,
               },
             ],
             details: {
-              count: memories.length,
-              memories,
-              total: result.total ?? memories.length,
+              count: allMemories.length,
+              memories: allMemories,
+              total: result.total ?? allMemories.length,
               scoreThreshold,
               requestLimit,
             },
@@ -1042,6 +1186,34 @@ const contextEnginePlugin = {
         }
       }
 
+      // ── Feature 1.5: Pinned Context Injection (session start, cached) ──
+      if (cfg.pinnedContextInjection) {
+        const PINNED_TTL_MS = 10 * 60 * 1000;
+        const now = Date.now();
+        const sid = ctx?.sessionId ?? "";
+        if (
+          !_pinnedCache ||
+          _pinnedCache.sid !== sid ||
+          now - _pinnedCache.ts > PINNED_TTL_MS
+        ) {
+          try {
+            const text = await withTimeout(
+              buildPinnedContext(client, agentId, cfg.pinnedContextBudgetChars),
+              8000,
+              "openviking: pinned context read timeout",
+            );
+            _pinnedCache = { text, ts: now, sid };
+          } catch {
+            _pinnedCache = { text: "", ts: now, sid };
+          }
+        }
+        if (_pinnedCache.text.trim()) {
+          prependContextParts.push(
+            `<pinned-context>\n${_pinnedCache.text.trim()}\n</pinned-context>`,
+          );
+        }
+      }
+
       // ── Feature 2: Directory Structure Pre-inject (session start, cached) ──
       if (cfg.directoryPreInject) {
         const DIR_TTL_MS = 30 * 60 * 1000;
@@ -1082,10 +1254,11 @@ const contextEnginePlugin = {
               (async () => {
                 const candidateLimit = Math.max(cfg.recallLimit * 4, 20);
 
-                // 4 parallel searches: user memories, agent memories, agent tools, agent skills
+                // 5 parallel searches: user memories, agent memories, agent tools, agent skills, resources
                 const searchPromises: [
                   Promise<FindResult>, Promise<FindResult>,
                   Promise<FindResult>, Promise<FindResult>,
+                  Promise<FindResult>,
                 ] = [
                   client.find(queryText, {
                     targetUri: "viking://user/memories",
@@ -1112,25 +1285,40 @@ const contextEnginePlugin = {
                     Promise.resolve({ memories: [] } as FindResult),
                     Promise.resolve({ memories: [] } as FindResult),
                   ]) as [Promise<FindResult>, Promise<FindResult>],
+                  cfg.recallResources
+                    ? client.find(queryText, {
+                        targetUri: "viking://resources",
+                        limit: candidateLimit,
+                        scoreThreshold: 0,
+                      }, agentId)
+                    : Promise.resolve({ memories: [] } as FindResult),
                 ];
 
-                const [userSettled, agentSettled, toolsSettled, skillsSettled] =
+                const [userSettled, agentSettled, toolsSettled, skillsSettled, resourcesSettled] =
                   await Promise.allSettled(searchPromises);
 
                 const userResult = userSettled.status === "fulfilled" ? userSettled.value : { memories: [] };
                 const agentResult = agentSettled.status === "fulfilled" ? agentSettled.value : { memories: [] };
                 const toolsResult = toolsSettled.status === "fulfilled" ? toolsSettled.value : { memories: [] };
                 const skillsResult = skillsSettled.status === "fulfilled" ? skillsSettled.value : { memories: [] };
+                const resourcesResult = resourcesSettled.status === "fulfilled" ? resourcesSettled.value : { memories: [] };
                 if (userSettled.status === "rejected") {
                   api.logger.warn(`openviking: user memories search failed: ${String(userSettled.reason)}`);
                 }
                 if (agentSettled.status === "rejected") {
                   api.logger.warn(`openviking: agent memories search failed: ${String(agentSettled.reason)}`);
                 }
+                if (resourcesSettled.status === "rejected") {
+                  api.logger.warn(`openviking: resources search failed: ${String(resourcesSettled.reason)}`);
+                }
 
-                // Route 1: user + agent memories → <relevant-memories>
+                // Route 1: user + agent + resources memories → <relevant-memories>
                 // (tools/skills excluded by pickMemoriesForInjection)
-                const allMemories = [...(userResult.memories ?? []), ...(agentResult.memories ?? [])];
+                const allMemories = [
+                  ...(userResult.memories ?? []),
+                  ...(agentResult.memories ?? []),
+                  ...(resourcesResult.memories ?? resourcesResult.resources ?? []),
+                ];
                 const uniqueMemories = allMemories.filter((memory, index, self) =>
                   index === self.findIndex((m) => m.uri === memory.uri)
                 );
@@ -1143,9 +1331,13 @@ const contextEnginePlugin = {
                 });
                 const memories = pickMemoriesForInjection(processed, cfg.recallLimit, queryText, cfg.recallUserRatio);
 
-                if (memories.length > 0) {
+                // 1-hop entity expansion for auto-recall
+                const expandedEntities = await expandEntityLinks(memories, client, agentId, 3);
+                const memoriesWithEntities = [...memories, ...expandedEntities];
+
+                if (memoriesWithEntities.length > 0) {
                   const { lines: memoryLines, estimatedTokens } = await buildMemoryLinesWithBudget(
-                    memories,
+                    memoriesWithEntities,
                     (uri) => client.read(uri, agentId),
                     {
                       recallPreferAbstract: cfg.recallPreferAbstract,
