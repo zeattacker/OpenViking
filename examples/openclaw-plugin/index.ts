@@ -11,7 +11,8 @@ import {
   compileSessionPatterns,
   isTranscriptLikeIngest,
   extractLatestUserText,
-  shouldSkipIngestReplyAssistSession,
+  sanitizeUserTextForCapture,
+  shouldBypassSession,
 } from "./text-utils.js";
 import {
   clampScore,
@@ -23,7 +24,7 @@ import {
 } from "./memory-ranking.js";
 import {
   IS_WIN,
-  waitForHealth,
+  waitForHealthOrExit,
   quickHealthCheck,
   quickRecallPrecheck,
   withTimeout,
@@ -110,6 +111,7 @@ type OpenClawPluginApi = {
 const MAX_OPENVIKING_STDERR_LINES = 200;
 const MAX_OPENVIKING_STDERR_CHARS = 256_000;
 const AUTO_RECALL_TIMEOUT_MS = 5_000;
+const RECALL_QUERY_MAX_CHARS = 4_000;
 
 // ── Session-start injection caches ──
 type SessionCache = { text: string; ts: number; sid: string };
@@ -205,6 +207,39 @@ export function sanitizeOpenVikingAgentIdHeader(raw: string): string {
     .replace(/_+/g, "_")
     .replace(/^_|_$/g, "");
   return normalized.length > 0 ? normalized : "ov_agent";
+}
+
+export type PreparedRecallQuery = {
+  query: string;
+  truncated: boolean;
+  originalChars: number;
+  finalChars: number;
+};
+
+export function prepareRecallQuery(rawText: string): PreparedRecallQuery {
+  const sanitized = sanitizeUserTextForCapture(rawText).trim();
+  const originalChars = sanitized.length;
+
+  if (!sanitized) {
+    return {
+      query: "",
+      truncated: false,
+      originalChars: 0,
+      finalChars: 0,
+    };
+  }
+
+  const query =
+    sanitized.length > RECALL_QUERY_MAX_CHARS
+      ? sanitized.slice(0, RECALL_QUERY_MAX_CHARS).trim()
+      : sanitized;
+
+  return {
+    query,
+    truncated: sanitized.length > RECALL_QUERY_MAX_CHARS,
+    originalChars,
+    finalChars: query.length,
+  };
 }
 
 function extractAgentIdFromSessionKey(sessionKey?: string): string | undefined {
@@ -354,9 +389,7 @@ const contextEnginePlugin = {
         ? (api.pluginConfig as Record<string, unknown>)
         : {};
     const cfg = memoryOpenVikingConfigSchema.parse(api.pluginConfig);
-    const ingestReplyAssistIgnoreSessionPatterns = compileSessionPatterns(
-      cfg.ingestReplyAssistIgnoreSessionPatterns,
-    );
+    const bypassSessionPatterns = compileSessionPatterns(cfg.bypassSessionPatterns);
     const rawAgentId = rawCfg.agentId;
     if (cfg.logFindRequests) {
       api.logger.info(
@@ -422,6 +455,10 @@ const contextEnginePlugin = {
             entry.resolve = resolve;
             entry.reject = reject;
           });
+          // Service startup can reject this shared promise before any hook/tool
+          // awaits it. Attach a sink now so expected local-startup failures do
+          // not surface as process-level unhandled rejections.
+          void entry.promise.catch(() => {});
           clientPromise = entry.promise;
           localClientPendingPromises.set(localCacheKey, entry);
         }
@@ -442,6 +479,25 @@ const contextEnginePlugin = {
 
     const getClient = (): Promise<OpenVikingClient> => clientPromise;
 
+    const isBypassedSession = (ctx?: {
+      sessionId?: string;
+      sessionKey?: string;
+    }): boolean => shouldBypassSession(ctx ?? {}, bypassSessionPatterns);
+
+    const makeBypassedToolResult = (toolName: string) => ({
+      content: [
+        {
+          type: "text" as const,
+          text: `OpenViking is bypassed for this session by bypassSessionPatterns; ${toolName} was skipped.`,
+        },
+      ],
+      details: {
+        action: "bypassed",
+        reason: "session_bypassed",
+        toolName,
+      },
+    });
+
     api.registerTool(
       (ctx: ToolContext) => ({
         name: "memory_recall",
@@ -461,6 +517,9 @@ const contextEnginePlugin = {
           ),
         }),
         async execute(_toolCallId: string, params: Record<string, unknown>) {
+          if (isBypassedSession(ctx)) {
+            return makeBypassedToolResult("memory_recall");
+          }
           rememberSessionAgentId(ctx);
           const agentId = resolveAgentId(ctx.sessionId, ctx.sessionKey);
           const { query } = params as { query: string };
@@ -576,6 +635,9 @@ const contextEnginePlugin = {
           sessionId: Type.Optional(Type.String({ description: "Existing OpenViking session ID" })),
         }),
         async execute(_toolCallId: string, params: Record<string, unknown>) {
+          if (isBypassedSession(ctx)) {
+            return makeBypassedToolResult("memory_store");
+          }
           rememberSessionAgentId(ctx);
           const storeAgentId = resolveAgentId(ctx.sessionId, ctx.sessionKey);
           const { text } = params as { text: string };
@@ -684,6 +746,9 @@ const contextEnginePlugin = {
           ),
         }),
         async execute(_toolCallId: string, params: Record<string, unknown>) {
+          if (isBypassedSession(ctx)) {
+            return makeBypassedToolResult("memory_forget");
+          }
           rememberSessionAgentId(ctx);
           const agentId = resolveAgentId(ctx.sessionId, ctx.sessionKey);
           const client = await getClient();
@@ -790,6 +855,9 @@ const contextEnginePlugin = {
         }),
       }),
       async execute(_toolCallId: string, params: Record<string, unknown>) {
+        if (isBypassedSession(ctx)) {
+          return makeBypassedToolResult("ov_archive_expand");
+        }
         rememberSessionAgentId(ctx);
         const archiveId = String((params as { archiveId?: string }).archiveId ?? "").trim();
         const sessionId = ctx.sessionId ?? "";
@@ -908,6 +976,12 @@ const contextEnginePlugin = {
           })}`,
         );
       }
+      if (isBypassedSession(ctx)) {
+        verboseRoutingInfo(
+          `openviking: bypassing before_prompt_build due to session pattern match (sessionKey=${ctx?.sessionKey ?? "none"}, sessionId=${ctx?.sessionId ?? "none"})`,
+        );
+        return;
+      }
       const agentId = resolveAgentId(ctx?.sessionId, ctx?.sessionKey);
       let client: OpenVikingClient;
       try {
@@ -922,11 +996,20 @@ const contextEnginePlugin = {
       }
 
       const eventObj = (event ?? {}) as { messages?: unknown[]; prompt?: string };
-      const queryText =
-        extractLatestUserText(eventObj.messages) ||
+      const latestUserText = extractLatestUserText(eventObj.messages);
+      const rawRecallQuery =
+        latestUserText ||
         (typeof eventObj.prompt === "string" ? eventObj.prompt.trim() : "");
+      const recallQuery = prepareRecallQuery(rawRecallQuery);
+      const queryText = recallQuery.query;
       if (!queryText) {
         return;
+      }
+      if (recallQuery.truncated) {
+        verboseRoutingInfo(
+          `openviking: recall query truncated (` +
+            `chars=${recallQuery.originalChars}->${recallQuery.finalChars})`,
+        );
       }
 
       const prependContextParts: string[] = [];
@@ -1112,28 +1195,22 @@ const contextEnginePlugin = {
       }
 
       if (cfg.ingestReplyAssist) {
-        if (shouldSkipIngestReplyAssistSession(ctx ?? {}, ingestReplyAssistIgnoreSessionPatterns)) {
+        const decision = isTranscriptLikeIngest(queryText, {
+          minSpeakerTurns: cfg.ingestReplyAssistMinSpeakerTurns,
+          minChars: cfg.ingestReplyAssistMinChars,
+        });
+        if (decision.shouldAssist) {
           verboseRoutingInfo(
-            `openviking: skipping ingest-reply-assist due to session pattern match (sessionKey=${ctx?.sessionKey ?? "none"}, sessionId=${ctx?.sessionId ?? "none"})`,
+            `openviking: ingest-reply-assist applied (reason=${decision.reason}, speakerTurns=${decision.speakerTurns}, chars=${decision.chars})`,
           );
-        } else {
-          const decision = isTranscriptLikeIngest(queryText, {
-            minSpeakerTurns: cfg.ingestReplyAssistMinSpeakerTurns,
-            minChars: cfg.ingestReplyAssistMinChars,
-          });
-          if (decision.shouldAssist) {
-            verboseRoutingInfo(
-              `openviking: ingest-reply-assist applied (reason=${decision.reason}, speakerTurns=${decision.speakerTurns}, chars=${decision.chars})`,
-            );
-            prependContextParts.push(
-              "<ingest-reply-assist>\n" +
-                "The latest user input looks like a multi-speaker transcript used for memory ingestion.\n" +
-                "Reply with 1-2 concise sentences to acknowledge or summarize key points.\n" +
-                "Do not output NO_REPLY or an empty reply.\n" +
-                "Do not fabricate facts beyond the provided transcript and recalled memories.\n" +
-                "</ingest-reply-assist>",
-            );
-          }
+          prependContextParts.push(
+            "<ingest-reply-assist>\n" +
+              "The latest user input looks like a multi-speaker transcript used for memory ingestion.\n" +
+              "Reply with 1-2 concise sentences to acknowledge or summarize key points.\n" +
+              "Do not output NO_REPLY or an empty reply.\n" +
+              "Do not fabricate facts beyond the provided transcript and recalled memories.\n" +
+              "</ingest-reply-assist>",
+          );
         }
       }
 
@@ -1147,10 +1224,16 @@ const contextEnginePlugin = {
       rememberSessionAgentId(ctx ?? {});
     });
     api.on("before_reset", async (_event: unknown, ctx?: HookAgentContext) => {
+      if (isBypassedSession(ctx)) {
+        verboseRoutingInfo(
+          `openviking: bypassing before_reset due to session pattern match (sessionKey=${ctx?.sessionKey ?? "none"}, sessionId=${ctx?.sessionId ?? "none"})`,
+        );
+        return;
+      }
       const sessionId = ctx?.sessionId;
       if (sessionId && contextEngineRef) {
         try {
-          const ok = await contextEngineRef.commitOVSession(sessionId);
+          const ok = await contextEngineRef.commitOVSession(sessionId, ctx?.sessionKey);
           if (ok) {
             api.logger.info(`openviking: committed OV session on reset for session=${sessionId}`);
           }
@@ -1172,6 +1255,10 @@ const contextEnginePlugin = {
           cfg,
           logger: api.logger,
           getClient,
+          quickPrecheck:
+            cfg.mode === "local"
+              ? () => quickRecallPrecheck(cfg.mode, cfg.baseUrl, cfg.port, localProcess)
+              : undefined,
           resolveAgentId,
           rememberSessionAgentId,
         });
@@ -1276,7 +1363,7 @@ const contextEnginePlugin = {
             api.logger.warn(`openviking: subprocess exited (code=${code}, signal=${signal})${out}`);
           });
           try {
-            await waitForHealth(baseUrl, timeoutMs, intervalMs);
+            await waitForHealthOrExit(baseUrl, timeoutMs, intervalMs, child);
             const client = new OpenVikingClient(
               baseUrl,
               cfg.apiKey,
@@ -1353,7 +1440,7 @@ const contextEnginePlugin = {
                 api.logger.warn(`openviking: re-spawned subprocess exited (code=${code}, signal=${signal})`);
               });
               try {
-                await waitForHealth(baseUrl, timeoutMs, intervalMs);
+                await waitForHealthOrExit(baseUrl, timeoutMs, intervalMs, child);
                 const client = new OpenVikingClient(baseUrl, cfg.apiKey, cfg.agentId, cfg.timeoutMs);
                 localClientCache.set(localCacheKey, { client, process: child });
                 if (resolveLocalClient) {

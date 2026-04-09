@@ -60,6 +60,13 @@ class S3Config(BaseModel):
         description="How to persist S3 directory markers: 'none' skips marker creation, 'empty' writes a zero-byte marker, and 'nonempty' writes a non-empty marker payload. Defaults to 'empty'.",
     )
 
+    disable_batch_delete: bool = Field(
+        default=False,
+        description="Disable batch delete (DeleteObjects) and use sequential single-object deletes instead. "
+        "Required for S3-compatible services like Alibaba Cloud OSS that require a Content-MD5 header "
+        "for DeleteObjects but AWS SDK v2 does not send it by default. Defaults to False.",
+    )
+
     model_config = {"extra": "forbid"}
 
     def validate_config(self):
@@ -103,6 +110,13 @@ class AGFSConfig(BaseModel):
         description="AGFS client mode: 'http-client' | 'binding-client'",
     )
 
+    impl: str = Field(
+        default="auto",
+        description="Binding implementation to use when mode is 'binding-client'. "
+        "'auto' = Rust first with Go fallback, 'rust' = Rust only, 'go' = Go only. "
+        "Can be overridden by the RAGFS_IMPL environment variable.",
+    )
+
     backend: str = Field(
         default="local", description="AGFS storage backend: 'local' | 's3' | 'memory'"
     )
@@ -135,6 +149,11 @@ class AGFSConfig(BaseModel):
         if self.mode not in ["http-client", "binding-client"]:
             raise ValueError(
                 f"Invalid AGFS mode: '{self.mode}'. Must be one of: 'http-client', 'binding-client'"
+            )
+
+        if self.impl not in ["auto", "rust", "go"]:
+            raise ValueError(
+                f"Invalid AGFS impl: '{self.impl}'. Must be one of: 'auto', 'rust', 'go'"
             )
 
         if self.backend not in ["local", "s3", "memory"]:

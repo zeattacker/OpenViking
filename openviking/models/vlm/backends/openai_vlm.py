@@ -10,6 +10,9 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urlparse
 
+
+from openviking.telemetry import tracer
+
 try:
     import openai
 except ImportError:
@@ -35,7 +38,7 @@ def _build_openai_client_kwargs(
     api_base: str,
     api_version: str | None,
     extra_headers: Dict[str, str] | None,
-    timeout: float | None = None,
+    timeout: float | None = 60.0,
 ) -> Dict[str, Any]:
     """Build kwargs dict shared by sync and async OpenAI/Azure client constructors."""
     if provider == "azure":
@@ -45,9 +48,11 @@ def _build_openai_client_kwargs(
             "api_key": api_key,
             "azure_endpoint": api_base,
             "api_version": api_version or DEFAULT_AZURE_API_VERSION,
+            "timeout": timeout,
         }
     else:
         kwargs = {"api_key": api_key, "base_url": api_base}
+    kwargs["timeout"] = timeout
     if extra_headers:
         kwargs["default_headers"] = extra_headers
     # Per-request timeout. Default in the OpenAI SDK is 600s, which is far too
@@ -141,6 +146,7 @@ class OpenAIVLM(VLMBase):
         duration_seconds: float = 0.0,
     ):
         if hasattr(response, "usage") and response.usage:
+            tracer.info(f"response.usage={response.usage}")
             prompt_tokens = response.usage.prompt_tokens
             completion_tokens = response.usage.completion_tokens
             self.update_token_usage(
@@ -170,7 +176,7 @@ class OpenAIVLM(VLMBase):
         """Build response from OpenAI response. Returns str or VLMResponse based on has_tools."""
         choice = response.choices[0]
         message = choice.message
-
+        tracer.info(f"result={message.content}")
         if has_tools:
             usage = {}
             if hasattr(response, "usage") and response.usage:
@@ -392,6 +398,7 @@ class OpenAIVLM(VLMBase):
             operation_name="OpenAI VLM completion",
         )
 
+    @tracer("vlm.call", ignore_result=True, ignore_args=["messages"])
     async def get_completion_async(
         self,
         prompt: str = "",
@@ -415,6 +422,9 @@ class OpenAIVLM(VLMBase):
                 self._update_token_usage_from_response(response, duration_seconds=elapsed)
                 return self._build_vlm_response(response, has_tools=True)
             return await self._extract_completion_content_async(response, elapsed)
+
+        # 用 tracer.info 打印请求
+        tracer.info(f"messages={json.dumps(kwargs, ensure_ascii=False, indent=2)}")
 
         return await retry_async(
             _call,

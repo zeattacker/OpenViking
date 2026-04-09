@@ -407,6 +407,7 @@ export class OpenVikingClient {
     content: string,
     parts?: Array<Record<string, unknown>>,
     agentId?: string,
+    createdAt?: string,
   ): Promise<void> {
     await this.emitRoutingDebug(
       "session message POST",
@@ -415,10 +416,15 @@ export class OpenVikingClient {
         sessionId,
         role,
         contentChars: content.length,
+        created_at: createdAt ?? null,
       },
       agentId,
     );
-    const body = parts && parts.length > 0 ? { role, parts } : { role, content };
+    const body: Record<string, unknown> =
+      parts && parts.length > 0 ? { role, parts } : { role, content };
+    if (createdAt) {
+      body.created_at = createdAt;
+    }
     await this.request<{ session_id: string }>(
       `/api/v1/sessions/${encodeURIComponent(sessionId)}/messages`,
       {
@@ -489,8 +495,9 @@ export class OpenVikingClient {
       if (!task) break;
       if (task.status === "completed") {
         const taskResult = (task.result ?? {}) as Record<string, unknown>;
+        const memoriesExtracted = (taskResult.memories_extracted ?? {}) as Record<string, number>;
         result.status = "completed";
-        result.memories_extracted = (taskResult.memories_extracted ?? {}) as Record<string, number>;
+        result.memories_extracted = memoriesExtracted;
         return result;
       }
       if (task.status === "failed") {

@@ -4,7 +4,7 @@
 Session Compressor for OpenViking.
 
 Handles extraction of long-term memories from session conversations.
-Uses MemoryExtractor for 6-category extraction and MemoryDeduplicator for LLM-based dedup.
+Uses MemoryExtractor for 8-category extraction and MemoryDeduplicator for LLM-based dedup.
 """
 
 import hashlib
@@ -13,6 +13,7 @@ from typing import Dict, List, Optional
 
 from openviking.core.context import Context, Vectorize
 from openviking.message import Message
+from openviking.models.embedder.base import embed_compat
 from openviking.server.identity import RequestContext
 from openviking.storage import VikingDBManager
 from openviking.storage.viking_fs import get_viking_fs
@@ -65,7 +66,7 @@ class ExtractionStats:
 
 
 class SessionCompressor:
-    """Session memory extractor with 6-category memory extraction."""
+    """Session memory extractor with 8-category memory extraction."""
 
     def __init__(
         self,
@@ -273,6 +274,16 @@ class SessionCompressor:
             target_memory.set_vectorize(Vectorize(text=payload.content))
             await self._index_memory(target_memory, ctx, change_type="modified")
             return True
+        except FileNotFoundError:
+            logger.warning(
+                "Target memory %s no longer exists — removing orphaned reference", target_memory.uri
+            )
+            # Clean up vector record for the missing file so it's not retried
+            try:
+                await self.vikingdb.delete_uris(ctx, [target_memory.uri])
+            except Exception:
+                pass
+            return False
         except Exception as e:
             logger.error(f"Failed to merge memory {target_memory.uri}: {e}")
             return False
@@ -548,8 +559,9 @@ class SessionCompressor:
                                             merged_text = (
                                                 f"{action.memory.abstract} {candidate.content}"
                                             )
-                                            merged_embed = self.deduplicator.embedder.embed(
-                                                merged_text
+                                            merged_embed = await embed_compat(
+                                                self.deduplicator.embedder,
+                                                merged_text,
                                             )
                                             batch_memories.append(
                                                 (merged_embed.dense_vector, action.memory)

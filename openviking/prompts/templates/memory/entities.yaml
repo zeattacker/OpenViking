@@ -1,6 +1,8 @@
 memory_type: entities
 description: |
   Entity memory — ONE card per distinct real-world entity.
+  Managed as Wikipedia-style pages (Zettelkasten method) with relative-path
+  links to events, resources, and other entities.
 
   Use for: people, organizations, projects, products, systems, places.
 
@@ -25,10 +27,18 @@ description: |
     contributor) must stay separate — having similar names is not
     evidence of being the same person.
 directory: "viking://user/{{ user_space }}/memories/entities"
-filename_template: "{{ name }}.md"
+filename_template: "{{ category }}/{{ name }}.md"
 enabled: true
 
 fields:
+  - name: category
+    type: string
+    description: |
+      - Top-level category grouping for this entity. Use one of:
+        people, organizations, projects, products, systems, places, concepts.
+      - Lowercase with underscores, max 3 words.
+    merge_op: immutable
+
   - name: name
     type: string
     description: |
@@ -69,12 +79,16 @@ fields:
           - `<any other known names>`
 
           ## Related
-          - [other_entity](../entities/other_entity.md) — relationship
+          - [other_entity](../entities/<category>/<name>.md) — relationship
+          - [event_name](../events/<year>/<month>/<day>/<event_name>.md) — participation
 
       Rules:
       - MAINTAIN the "## Aliases" section. Every time you see a new name
         referring to this entity, append it there. Never delete entries.
-      - Link to related entities via relative paths `../entities/name.md`.
+      - Link to related entities via relative paths:
+        `../entities/<category>/<entity_name>.md`
+      - Link to events the entity participated in via relative paths:
+        `../events/<year>/<month>/<day>/<event_name>.md`
       - If content grows long, expand inline — do NOT split into multiple
         cards.
       - When editing, preserve existing sections. Add new facts under

@@ -28,6 +28,7 @@ from openviking.storage.queuefs.semantic_dag import DagStats, SemanticDagExecuto
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.viking_fs import get_viking_fs
 from openviking.telemetry import bind_telemetry, resolve_telemetry
+from openviking.telemetry.request_wait_tracker import get_request_wait_tracker
 from openviking.utils.circuit_breaker import (
     CircuitBreaker,
     CircuitBreakerOpen,
@@ -54,6 +55,7 @@ class DiffResult:
 
 class RequestQueueStats:
     processed: int = 0
+    requeue_count: int = 0
     error_count: int = 0
 
 
@@ -123,6 +125,7 @@ class SemanticProcessor(DequeueHandlerBase):
         cls,
         telemetry_id: str,
         processed: int = 0,
+        requeue_count: int = 0,
         error_count: int = 0,
     ) -> None:
         if not telemetry_id:
@@ -130,6 +133,7 @@ class SemanticProcessor(DequeueHandlerBase):
         with cls._stats_lock:
             stats = cls._request_stats_by_telemetry_id.setdefault(telemetry_id, RequestQueueStats())
             stats.processed += processed
+            stats.requeue_count += requeue_count
             stats.error_count += error_count
             cls._request_stats_order.append(telemetry_id)
             if len(cls._request_stats_order) > cls._max_cached_stats:
@@ -237,6 +241,7 @@ class SemanticProcessor(DequeueHandlerBase):
         """Process dequeued SemanticMsg, recursively process all subdirectories."""
         msg: Optional[SemanticMsg] = None
         collector = None
+        release_lock_in_finally = True
         try:
             import json
 
@@ -256,6 +261,9 @@ class SemanticProcessor(DequeueHandlerBase):
                     f"Circuit breaker is open, re-enqueueing semantic message: {msg.uri}"
                 )
                 await self._reenqueue_semantic_msg(msg)
+                self._merge_request_stats(msg.telemetry_id, requeue_count=1)
+                get_request_wait_tracker().record_semantic_requeue(msg.telemetry_id)
+                self.report_requeue()
                 self.report_success()
                 return None
             collector = resolve_telemetry(msg.telemetry_id)
@@ -301,11 +309,15 @@ class SemanticProcessor(DequeueHandlerBase):
                         incremental_update=is_incremental,
                         target_uri=msg.target_uri,
                         semantic_msg_id=msg.id,
+                        telemetry_id=msg.telemetry_id,
                         recursive=msg.recursive,
                         lifecycle_lock_handle_id=msg.lifecycle_lock_handle_id,
                         is_code_repo=msg.is_code_repo,
                     )
                     self._dag_executor = executor
+                    if msg.lifecycle_lock_handle_id:
+                        # The DAG owns lifecycle lock release after this point.
+                        release_lock_in_finally = False
                     await executor.run(msg.uri)
                     self._cache_dag_stats(
                         msg.telemetry_id,
@@ -328,6 +340,9 @@ class SemanticProcessor(DequeueHandlerBase):
                 self._circuit_breaker.record_failure(e)
                 if msg is not None:
                     self._merge_request_stats(msg.telemetry_id, error_count=1)
+                    get_request_wait_tracker().mark_semantic_failed(
+                        msg.telemetry_id, msg.id, str(e)
+                    )
                 self.report_error(str(e), data)
             else:
                 # Transient or unknown — re-enqueue for retry
@@ -339,9 +354,15 @@ class SemanticProcessor(DequeueHandlerBase):
                 if msg is not None:
                     try:
                         await self._reenqueue_semantic_msg(msg)
+                        self._merge_request_stats(msg.telemetry_id, requeue_count=1)
+                        get_request_wait_tracker().record_semantic_requeue(msg.telemetry_id)
+                        self.report_requeue()
                     except Exception as requeue_err:
                         logger.error(f"Failed to re-enqueue semantic message: {requeue_err}")
                         self._merge_request_stats(msg.telemetry_id, error_count=1)
+                        get_request_wait_tracker().mark_semantic_failed(
+                            msg.telemetry_id, msg.id, str(e)
+                        )
                         self.report_error(str(e), data)
                         return None
                     self.report_success()
@@ -351,7 +372,7 @@ class SemanticProcessor(DequeueHandlerBase):
         finally:
             # Safety net: release lifecycle lock if still held (e.g. on exception
             # before the DAG executor took ownership)
-            if msg and msg.lifecycle_lock_handle_id:
+            if release_lock_in_finally and msg and msg.lifecycle_lock_handle_id:
                 try:
                     from openviking.storage.transaction import get_lock_manager
 
@@ -407,11 +428,23 @@ class SemanticProcessor(DequeueHandlerBase):
         dir_uri = msg.uri
         ctx = self._current_ctx
         llm_sem = asyncio.Semaphore(self.max_concurrent_llm)
+        request_wait_tracker = get_request_wait_tracker()
+
+        def _mark_done() -> None:
+            if msg.telemetry_id and msg.id:
+                request_wait_tracker.mark_semantic_done(msg.telemetry_id, msg.id)
+
+        def _mark_failed(message: str) -> None:
+            if msg.telemetry_id and msg.id:
+                request_wait_tracker.mark_semantic_failed(msg.telemetry_id, msg.id, message)
 
         try:
             entries = await viking_fs.ls(dir_uri, ctx=ctx)
         except Exception as e:
             logger.warning(f"Failed to list memory directory {dir_uri}: {e}")
+            _mark_failed(str(e))
+            if msg.lifecycle_lock_handle_id:
+                await self._release_memory_lifecycle_lock(msg.lifecycle_lock_handle_id)
             return
 
         file_paths: List[str] = []
@@ -425,6 +458,9 @@ class SemanticProcessor(DequeueHandlerBase):
 
         if not file_paths:
             logger.info(f"No memory files found in {dir_uri}")
+            _mark_done()
+            if msg.lifecycle_lock_handle_id:
+                await self._release_memory_lifecycle_lock(msg.lifecycle_lock_handle_id)
             return
 
         file_summaries: List[Dict[str, str]] = []
@@ -467,7 +503,7 @@ class SemanticProcessor(DequeueHandlerBase):
 
         if pending_indices:
             logger.info(
-                f"Generating summaries for {len(pending_indices)} changed files concurrently "
+                f"Generating summaries for {len(pending_indices)} changed files "
                 f"(reused {len(file_paths) - len(pending_indices)} cached)"
             )
 
@@ -483,7 +519,17 @@ class SemanticProcessor(DequeueHandlerBase):
                     logger.warning(f"Failed to generate summary for {file_path}: {e}")
                     file_summaries[idx] = {"name": file_name, "summary": ""}
 
-            await asyncio.gather(*[_gen(i, fp) for i, fp in pending_indices])
+            # Fix for Issue #1245: Batch processing to prevent coroutine scheduling storms
+            # Use a reasonable batch size (min of semaphore and 10) to keep event loop responsive
+            batch_size = max(1, min(self.max_concurrent_llm, 10))
+            for batch_start in range(0, len(pending_indices), batch_size):
+                batch = pending_indices[batch_start : batch_start + batch_size]
+                logger.info(
+                    f"[MemorySemantic] Processing batch {batch_start // batch_size + 1}/"
+                    f"{(len(pending_indices) + batch_size - 1) // batch_size} "
+                    f"({len(batch)} files)"
+                )
+                await asyncio.gather(*[_gen(i, fp) for i, fp in batch])
 
         file_summaries = [s for s in file_summaries if s is not None]
 
@@ -516,17 +562,48 @@ class SemanticProcessor(DequeueHandlerBase):
             await viking_fs.write_file(f"{dir_uri}/.abstract.md", abstract, ctx=ctx)
         except Exception as e:
             logger.error(f"Failed to write abstract/overview for {dir_uri}: {e}")
+            _mark_failed(str(e))
+            if msg.lifecycle_lock_handle_id:
+                await self._release_memory_lifecycle_lock(msg.lifecycle_lock_handle_id)
             return
 
-        await self._vectorize_directory(
-            uri=dir_uri,
-            context_type="memory",
-            abstract=abstract,
-            overview=overview,
-            ctx=ctx,
-            semantic_msg_id=msg.id,
-        )
-        logger.info(f"Vectorized abstract.md and overview.md for {dir_uri}")
+        try:
+            if msg.telemetry_id and msg.id:
+                from openviking.storage.queuefs.embedding_tracker import EmbeddingTaskTracker
+
+                async def _on_complete() -> None:
+                    get_request_wait_tracker().mark_semantic_done(msg.telemetry_id, msg.id)
+
+                tracker = EmbeddingTaskTracker.get_instance()
+                await tracker.register(
+                    semantic_msg_id=msg.id,
+                    total_count=2,
+                    on_complete=_on_complete,
+                    metadata={"uri": dir_uri},
+                )
+            await self._vectorize_directory(
+                uri=dir_uri,
+                context_type="memory",
+                abstract=abstract,
+                overview=overview,
+                ctx=ctx,
+                semantic_msg_id=msg.id,
+            )
+            logger.info(f"Vectorized abstract.md and overview.md for {dir_uri}")
+        finally:
+            if msg.lifecycle_lock_handle_id:
+                await self._release_memory_lifecycle_lock(msg.lifecycle_lock_handle_id)
+
+    async def _release_memory_lifecycle_lock(self, handle_id: str) -> None:
+        """Release a lifecycle lock held by in-place memory refresh."""
+        try:
+            from openviking.storage.transaction import get_lock_manager
+
+            handle = get_lock_manager().get_handle(handle_id)
+            if handle:
+                await get_lock_manager().release(handle)
+        except Exception as e:
+            logger.warning(f"[SemanticProcessor] Failed to release memory lifecycle lock: {e}")
 
         # Vectorize individual memory files that are missing correct vectors.
         # In the normal extraction flow, memory_updater._vectorize_memories()
@@ -584,9 +661,15 @@ class SemanticProcessor(DequeueHandlerBase):
         target_uri: str,
         ctx: Optional[RequestContext] = None,
         file_change_status: Optional[Dict[str, bool]] = None,
+        lifecycle_lock_handle_id: str = "",
     ) -> DiffResult:
         viking_fs = get_viking_fs()
         diff = DiffResult()
+        lock_handle = None
+        if lifecycle_lock_handle_id:
+            from openviking.storage.transaction import get_lock_manager
+
+            lock_handle = get_lock_manager().get_handle(lifecycle_lock_handle_id)
 
         async def list_children(dir_uri: str) -> Tuple[Dict[str, str], Dict[str, str]]:
             files: Dict[str, str] = {}
@@ -615,7 +698,12 @@ class SemanticProcessor(DequeueHandlerBase):
             target_files, target_dirs = await list_children(target_dir)
 
             try:
-                await viking_fs._mv_vector_store_l0_l1(root_dir, target_dir, ctx=ctx)
+                await viking_fs._mv_vector_store_l0_l1(
+                    root_dir,
+                    target_dir,
+                    ctx=ctx,
+                    lock_handle=lock_handle,
+                )
             except Exception as e:
                 logger.error(
                     f"[SyncDiff] Failed to move L0/L1 index: {root_dir} -> {target_dir}, error={e}"
@@ -629,7 +717,12 @@ class SemanticProcessor(DequeueHandlerBase):
                 if root_file and name in target_dirs:
                     target_conflict_dir = target_dirs[name]
                     try:
-                        await viking_fs.rm(target_conflict_dir, recursive=True, ctx=ctx)
+                        await viking_fs.rm(
+                            target_conflict_dir,
+                            recursive=True,
+                            ctx=ctx,
+                            lock_handle=lock_handle,
+                        )
                         diff.deleted_dirs.append(target_conflict_dir)
                         target_dirs.pop(name, None)
                     except Exception as e:
@@ -640,7 +733,7 @@ class SemanticProcessor(DequeueHandlerBase):
 
                 if target_file and name in root_dirs and not root_file:
                     try:
-                        await viking_fs.rm(target_file, ctx=ctx)
+                        await viking_fs.rm(target_file, ctx=ctx, lock_handle=lock_handle)
                         diff.deleted_files.append(target_file)
                         target_files.pop(name, None)
                     except Exception as e:
@@ -651,7 +744,7 @@ class SemanticProcessor(DequeueHandlerBase):
 
                 if target_file and not root_file:
                     try:
-                        await viking_fs.rm(target_file, ctx=ctx)
+                        await viking_fs.rm(target_file, ctx=ctx, lock_handle=lock_handle)
                         diff.deleted_files.append(target_file)
                     except Exception as e:
                         logger.error(f"[SyncDiff] Failed to delete file: {target_file}, error={e}")
@@ -674,13 +767,18 @@ class SemanticProcessor(DequeueHandlerBase):
                     if changed:
                         diff.updated_files.append(root_file)
                         try:
-                            await viking_fs.rm(target_file, ctx=ctx)
+                            await viking_fs.rm(target_file, ctx=ctx, lock_handle=lock_handle)
                         except Exception as e:
                             logger.error(
                                 f"[SyncDiff] Failed to remove old file before update: {target_file}, error={e}"
                             )
                         try:
-                            await viking_fs.mv(root_file, target_file, ctx=ctx)
+                            await viking_fs.mv(
+                                root_file,
+                                target_file,
+                                ctx=ctx,
+                                lock_handle=lock_handle,
+                            )
                         except Exception as e:
                             logger.error(
                                 f"[SyncDiff] Failed to move updated file: {root_file} -> {target_file}, error={e}"
@@ -691,7 +789,12 @@ class SemanticProcessor(DequeueHandlerBase):
                     diff.added_files.append(root_file)
                     target_file_uri = VikingURI(target_dir).join(name).uri
                     try:
-                        await viking_fs.mv(root_file, target_file_uri, ctx=ctx)
+                        await viking_fs.mv(
+                            root_file,
+                            target_file_uri,
+                            ctx=ctx,
+                            lock_handle=lock_handle,
+                        )
                     except Exception as e:
                         logger.error(
                             f"[SyncDiff] Failed to move added file: {root_file} -> {target_file_uri}, error={e}"
@@ -705,7 +808,11 @@ class SemanticProcessor(DequeueHandlerBase):
                 if root_subdir and name in target_files:
                     target_conflict_file = target_files[name]
                     try:
-                        await viking_fs.rm(target_conflict_file, ctx=ctx)
+                        await viking_fs.rm(
+                            target_conflict_file,
+                            ctx=ctx,
+                            lock_handle=lock_handle,
+                        )
                         diff.deleted_files.append(target_conflict_file)
                         target_files.pop(name, None)
                     except Exception as e:
@@ -716,7 +823,12 @@ class SemanticProcessor(DequeueHandlerBase):
 
                 if target_subdir and not root_subdir:
                     try:
-                        await viking_fs.rm(target_subdir, recursive=True, ctx=ctx)
+                        await viking_fs.rm(
+                            target_subdir,
+                            recursive=True,
+                            ctx=ctx,
+                            lock_handle=lock_handle,
+                        )
                         diff.deleted_dirs.append(target_subdir)
                     except Exception as e:
                         logger.error(
@@ -728,7 +840,12 @@ class SemanticProcessor(DequeueHandlerBase):
                     diff.added_dirs.append(root_subdir)
                     target_subdir_uri = VikingURI(target_dir).join(name).uri
                     try:
-                        await viking_fs.mv(root_subdir, target_subdir_uri, ctx=ctx)
+                        await viking_fs.mv(
+                            root_subdir,
+                            target_subdir_uri,
+                            ctx=ctx,
+                            lock_handle=lock_handle,
+                        )
                     except Exception as e:
                         logger.error(
                             f"[SyncDiff] Failed to move added directory: {root_subdir} -> {target_subdir_uri}, error={e}"
@@ -744,7 +861,7 @@ class SemanticProcessor(DequeueHandlerBase):
             if parent_uri:
                 await viking_fs.mkdir(parent_uri.uri, exist_ok=True, ctx=ctx)
             diff.added_dirs.append(root_uri)
-            await viking_fs.mv(root_uri, target_uri, ctx=ctx)
+            await viking_fs.mv(root_uri, target_uri, ctx=ctx, lock_handle=lock_handle)
             return diff
 
         await sync_dir(root_uri, target_uri)

@@ -64,6 +64,27 @@ class ExtractContext:
         msg_range = self.read_message_ranges(ranges_str)
         return msg_range._first_message_time_with_weekday()
 
+    def get_year(self, ranges_str: str) -> str | None:
+        """根据 ranges 字符串获取第一条消息的年份 (used by events.yaml filename_template)"""
+        if not ranges_str:
+            return None
+        first_time = self.read_message_ranges(ranges_str)._first_message_time()
+        return first_time.split("-")[0] if first_time else None
+
+    def get_month(self, ranges_str: str) -> str | None:
+        """根据 ranges 字符串获取第一条消息的月份 (used by events.yaml filename_template)"""
+        if not ranges_str:
+            return None
+        first_time = self.read_message_ranges(ranges_str)._first_message_time()
+        return first_time.split("-")[1] if first_time else None
+
+    def get_day(self, ranges_str: str) -> str | None:
+        """根据 ranges 字符串获取第一条消息的日期 (used by events.yaml filename_template)"""
+        if not ranges_str:
+            return None
+        first_time = self.read_message_ranges(ranges_str)._first_message_time()
+        return first_time.split("-")[2] if first_time else None
+
     def read_message_ranges(self, ranges_str: str) -> "MessageRange":
         """Parse ranges string like "0-10,50-60" or "7,9,11,13" and return combined MessageRange.
 
