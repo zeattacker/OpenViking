@@ -252,19 +252,26 @@ class MemoryTypeRegistry:
             except Exception:
                 pass
 
-            # Add MEMORY_FIELDS comment with field metadata
-            # Template rendering is handled inside serialize_with_metadata
+            # Render content_template inline (dev's serialize_with_metadata takes
+            # content as a positional arg and does not do template rendering itself).
             from openviking.session.memory.utils.content import serialize_with_metadata
+
+            try:
+                rendered_content = env.from_string(schema.content_template).render(
+                    **fields_with_init
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[MemoryTypeRegistry] Failed to render content template for "
+                    f"{schema.memory_type}: {e}"
+                )
+                rendered_content = ""
 
             metadata = {
                 "memory_type": schema.memory_type,
                 **fields_with_init,
-                "content": "",  # content will come from content_template rendering
             }
-            full_content = serialize_with_metadata(
-                metadata,
-                content_template=schema.content_template,
-            )
+            full_content = serialize_with_metadata(rendered_content, metadata)
 
             # Write the file
             try:
