@@ -12,6 +12,29 @@ class VLMConfig(BaseModel):
     api_key: Optional[str] = Field(default=None, description="API key")
     api_base: Optional[str] = Field(default=None, description="API base URL")
     temperature: float = Field(default=0.0, description="Generation temperature")
+    top_p: Optional[float] = Field(
+        default=None,
+        description=(
+            "Nucleus sampling parameter. Standard OpenAI API field. None = "
+            "use provider default. Recommended values: 0.85-0.95 for most "
+            "models, 0.9 for 1-bit Bonsai."
+        ),
+    )
+    top_k: Optional[int] = Field(
+        default=None,
+        description=(
+            "Top-k sampling parameter (llama.cpp / vLLM extension, routed via "
+            "extra_body). None = use provider default. Recommended: 20-40, "
+            "Bonsai 1-bit needs 20 to avoid sampling collapse."
+        ),
+    )
+    repeat_penalty: Optional[float] = Field(
+        default=None,
+        description=(
+            "Repetition penalty (llama.cpp extension, routed via extra_body). "
+            "None = use provider default (1.0). Higher = less repetition."
+        ),
+    )
     max_retries: int = Field(default=3, description="Maximum retry attempts")
 
     provider: Optional[str] = Field(default=None, description="Provider type")
@@ -48,6 +71,20 @@ class VLMConfig(BaseModel):
 
     stream: bool = Field(
         default=False, description="Enable streaming mode for OpenAI-compatible providers"
+    )
+
+    extraction_text_mode: bool = Field(
+        default=False,
+        description=(
+            "If True, memory extraction skips OpenAI tool-calling entirely and "
+            "relies on the JSON-schema-in-system-prompt path only. The LLM emits "
+            "structured operations as JSON in the message content, parsed via "
+            "parse_json_with_stability. Use this for small or quantized models "
+            "where llama.cpp's grammar-constrained generation wedges on the "
+            "extraction schema. Loses the read/search escape hatch the LLM "
+            "would otherwise use to fetch existing entity files for EDIT, but "
+            "the existing extraction prompt already discourages tool use."
+        ),
     )
 
     _vlm_instance: Optional[Any] = None
@@ -158,6 +195,9 @@ class VLMConfig(BaseModel):
         result = {
             "model": self.model,
             "temperature": self.temperature,
+            "top_p": self.top_p,
+            "top_k": self.top_k,
+            "repeat_penalty": self.repeat_penalty,
             "max_retries": self.max_retries,
             "provider": name,
             "thinking": self.thinking,

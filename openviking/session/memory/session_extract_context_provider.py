@@ -478,8 +478,20 @@ Before finalizing: review your reasoning. If you identified facts, people, or ev
         return ["read"]
 
     def get_memory_schemas(self, ctx: RequestContext) -> List[Any]:
-        """获取需要参与的 memory schemas（内部自动加载）"""
-        return self._get_registry().list_all(include_disabled=False)
+        """获取需要参与的 memory schemas（内部自动加载）.
+
+        Excludes `episodes`: they are generated as a separate post-extraction
+        step by `episode_indexer`, not inside the ReAct loop. If we leave them
+        in the structured operations schema, the LLM happily emits episode
+        items that collide with `episode_indexer`'s output and hit the
+        filename_template bug (fields `episode_title`/`session_time` don't
+        match the template vars `date`/`title_slug`, producing files named
+        `{{ date }}_{{ title_slug }}.md` via Jinja DebugUndefined passthrough).
+        This matches the existing exclusion in `_build_extraction_checklist`
+        and `prefetch`.
+        """
+        schemas = self._get_registry().list_all(include_disabled=False)
+        return [s for s in schemas if s.memory_type != "episodes"]
 
     def get_schema_directories(self) -> List[str]:
         """返回需要加载的 schema 目录"""

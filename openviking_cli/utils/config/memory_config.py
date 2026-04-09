@@ -146,6 +146,18 @@ class MemoryConfig(BaseModel):
         description="Memory recall ranking settings (category-based score boosts)",
     )
 
+    small_model_mode: bool = Field(
+        default=False,
+        description=(
+            "Enable extraction adaptations for small (~8B) models that lack "
+            "function calling or nested-JSON-schema instruction following. "
+            "When True: forces compact JSON schema (~200 tokens), disables "
+            "tool calling (extraction_text_mode), and requests json_object "
+            "response_format. Default False preserves existing behavior for "
+            "larger instruction-tuned models (Qwen 35B, GPT-4, etc.)."
+        ),
+    )
+
     model_config = {"extra": "forbid"}
 
     @field_validator("agent_scope_mode")

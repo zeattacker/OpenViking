@@ -35,6 +35,7 @@ def _build_openai_client_kwargs(
     api_base: str,
     api_version: str | None,
     extra_headers: Dict[str, str] | None,
+    timeout: float | None = None,
 ) -> Dict[str, Any]:
     """Build kwargs dict shared by sync and async OpenAI/Azure client constructors."""
     if provider == "azure":
@@ -49,6 +50,12 @@ def _build_openai_client_kwargs(
         kwargs = {"api_key": api_key, "base_url": api_base}
     if extra_headers:
         kwargs["default_headers"] = extra_headers
+    # Per-request timeout. Default in the OpenAI SDK is 600s, which is far too
+    # long for local LLM stalls — a single wedged request on LM Studio/llama.cpp
+    # will hold the queue for 10 minutes while we think we're still extracting.
+    # Surface this as an explicit kwarg so the VLM config can override it.
+    if timeout is not None:
+        kwargs["timeout"] = float(timeout)
     return kwargs
 
 
@@ -60,6 +67,12 @@ class OpenAIVLM(VLMBase):
         self._sync_client = None
         self._async_client = None
         self.api_version = config.get("api_version")
+        # Per-request HTTP timeout for the OpenAI client, in seconds. Falls back
+        # to a conservative default (90s) if the vlm config doesn't specify one.
+        # Local LLM backends (LM Studio, llama.cpp) can silently wedge after
+        # several sustained requests; a short explicit timeout turns that hang
+        # into a retryable error instead of a 10-minute session lockup.
+        self.request_timeout = float(config.get("request_timeout", 90.0))
 
     def get_client(self):
         """Get sync client"""
@@ -72,6 +85,7 @@ class OpenAIVLM(VLMBase):
                 self.api_base,
                 self.api_version,
                 self.extra_headers,
+                timeout=self.request_timeout,
             )
             if self.provider == "azure":
                 self._sync_client = openai.AzureOpenAI(**kwargs)
@@ -90,6 +104,7 @@ class OpenAIVLM(VLMBase):
                 self.api_base,
                 self.api_version,
                 self.extra_headers,
+                timeout=self.request_timeout,
             )
             if self.provider == "azure":
                 self._async_client = openai.AsyncAzureOpenAI(**kwargs)
@@ -250,6 +265,7 @@ class OpenAIVLM(VLMBase):
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
         thinking: bool = False,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         kwargs_messages = messages or [{"role": "user", "content": prompt}]
         kwargs = {
@@ -264,6 +280,8 @@ class OpenAIVLM(VLMBase):
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
+        if response_format:
+            kwargs["response_format"] = response_format
         return kwargs
 
     def _build_vision_kwargs(
@@ -322,10 +340,13 @@ class OpenAIVLM(VLMBase):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> Union[str, VLMResponse]:
         """Get text completion"""
         client = self.get_client()
-        kwargs = self._build_text_kwargs(prompt, tools, tool_choice, messages, thinking)
+        kwargs = self._build_text_kwargs(
+            prompt, tools, tool_choice, messages, thinking, response_format
+        )
 
         def _call() -> Union[str, VLMResponse]:
             t0 = time.perf_counter()
@@ -350,10 +371,13 @@ class OpenAIVLM(VLMBase):
         tools: Optional[List[Dict[str, Any]]] = None,
         tool_choice: Optional[str] = None,
         messages: Optional[List[Dict[str, Any]]] = None,
+        response_format: Optional[Dict[str, Any]] = None,
     ) -> Union[str, VLMResponse]:
         """Get text completion asynchronously"""
         client = self.get_async_client()
-        kwargs = self._build_text_kwargs(prompt, tools, tool_choice, messages, thinking)
+        kwargs = self._build_text_kwargs(
+            prompt, tools, tool_choice, messages, thinking, response_format
+        )
 
         async def _call() -> Union[str, VLMResponse]:
             t0 = time.perf_counter()

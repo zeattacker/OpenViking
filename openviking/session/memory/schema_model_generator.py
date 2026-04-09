@@ -342,15 +342,79 @@ class SchemaModelGenerator:
         self._operations_model = StructuredMemoryOperations
         return self._operations_model
 
-    def get_llm_json_schema(self) -> Dict[str, Any]:
+    def get_llm_json_schema(self, compact: bool = False) -> Dict[str, Any]:
         """
         Get the JSON schema for LLM structured output.
+
+        Args:
+            compact: If True, strip descriptions and simplify types for small models.
+                     Reduces schema from ~1200 tokens to ~200 tokens.
 
         Returns:
             JSON schema dictionary suitable for LLM API
         """
         operations_model = self.create_structured_operations_model()
-        return operations_model.model_json_schema()
+        schema = operations_model.model_json_schema()
+
+        if compact:
+            schema = self._compact_schema(schema)
+
+        return schema
+
+    @staticmethod
+    def _compact_schema(schema: Dict[str, Any]) -> Dict[str, Any]:
+        """Strip descriptions, examples, and simplify union types for small models."""
+        import copy
+
+        schema = copy.deepcopy(schema)
+
+        def _simplify(node: Any) -> Any:
+            if isinstance(node, dict):
+                # Remove verbose keys
+                for key in ("description", "examples", "default"):
+                    node.pop(key, None)
+                # Simplify anyOf/oneOf. Two goals for small-model compat:
+                #   1. Remove PATCH types (StrPatch / SearchReplaceBlock $refs)
+                #      which require tool-calling-grade instruction following.
+                #   2. Strip null branches so every field is required — small
+                #      models otherwise legally emit `"field": null` which
+                #      creates empty leaf files and silently drops content.
+                if "anyOf" in node:
+                    types = node["anyOf"]
+                    has_str = any(t.get("type") == "string" for t in types if isinstance(t, dict))
+                    has_ref = any("$ref" in t for t in types if isinstance(t, dict))
+                    if has_str and has_ref:
+                        # Union[str, StrPatch, None] → required str
+                        node.clear()
+                        node.update({"type": "string"})
+                        return node
+                    # Strip just the null branch from any remaining unions.
+                    # Union[X, None] → X (required). Keeps multi-type unions
+                    # intact minus the null option.
+                    non_null = [
+                        t for t in types
+                        if not (isinstance(t, dict) and t.get("type") == "null")
+                    ]
+                    if len(non_null) != len(types):
+                        if len(non_null) == 1 and isinstance(non_null[0], dict):
+                            node.clear()
+                            node.update(non_null[0])
+                            return _simplify(node)
+                        node["anyOf"] = non_null
+                for k, v in list(node.items()):
+                    node[k] = _simplify(v)
+            elif isinstance(node, list):
+                return [_simplify(item) for item in node]
+            return node
+
+        _simplify(schema)
+
+        # Remove StrPatch and SearchReplaceBlock from $defs entirely
+        defs = schema.get("$defs", {})
+        for remove_key in ("StrPatch", "SearchReplaceBlock"):
+            defs.pop(remove_key, None)
+
+        return schema
 
     def get_memory_data_json_schema(self) -> Dict[str, Any]:
         """

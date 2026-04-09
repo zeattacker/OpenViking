@@ -1063,9 +1063,11 @@ class Session:
         full_text = "\n".join(text_parts)
         text_lower = full_text.lower()
 
-        # Check for trivial keyword patterns
+        # Check for trivial keyword patterns (word-boundary match to avoid
+        # false positives like "camping" matching "ping")
         for pattern in trivial_config.patterns:
-            if pattern.lower() in text_lower:
+            escaped = re.escape(pattern.lower())
+            if re.search(rf"\b{escaped}\b", text_lower):
                 logger.debug(f"Trivial pattern matched: '{pattern}'")
                 return True
 

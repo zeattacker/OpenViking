@@ -52,6 +52,7 @@ class ExtractLoop:
         max_iterations: int = 3,
         ctx: Optional[RequestContext] = None,
         context_provider: Optional[Any] = None,  # ExtractContextProvider
+        extraction_text_mode: bool = False,
     ):
         """
         Initialize the ExtractLoop.
@@ -63,6 +64,11 @@ class ExtractLoop:
             max_iterations: Maximum number of ReAct iterations (default: 5)
             ctx: Request context
             context_provider: ExtractContextProvider - 必须提供（由 provider 加载 schema）
+            extraction_text_mode: If True, never pass `tools=` to the LLM. The
+                model emits structured operations as JSON in `content` only,
+                parsed via parse_json_with_stability. Used for small / quantized
+                models where llama.cpp grammar-constrained sampling wedges on
+                the extraction schema.
         """
         self.vlm = vlm
         self.viking_fs = viking_fs or get_viking_fs()
@@ -70,6 +76,7 @@ class ExtractLoop:
         self.max_iterations = max_iterations
         self.ctx = ctx
         self.context_provider = context_provider
+        self.extraction_text_mode = extraction_text_mode
 
         # Schema 生成器（在 run() 中初始化）
         self.schema_model_generator = None
@@ -84,6 +91,66 @@ class ExtractLoop:
         self._read_files: Set[str] = set()
         # Transaction handle for file locking
         self._transaction_handle = None
+
+    def _build_prefetch_summary(self, tool_call_messages: list) -> str:
+        """Build a summary of prefetched context to nudge direct JSON output."""
+        # Count what was found in prefetch
+        found_items = 0
+        for msg in tool_call_messages:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                content = msg.get("content", "")
+                if isinstance(content, str) and "result" in content:
+                    found_items += 1
+
+        if found_items == 0:
+            return (
+                "Memory directories are empty. Analyze the conversation above and output your "
+                "extraction JSON directly. Extract ALL new facts as ADD operations."
+            )
+        return (
+            f"Pre-fetched {found_items} existing memory files. They cover PRIOR conversations. "
+            "Analyze the conversation above and output your extraction JSON directly. "
+            "Extract NEW facts from THIS conversation as ADD operations. Use EDIT only when a "
+            "new fact extends an existing entity card."
+        )
+
+    @staticmethod
+    def _is_placeholder_query(query: str) -> bool:
+        """Detect placeholder search queries that small models copy from prompts."""
+        placeholders = {"[keywords]", "[keyword]", "keywords", "[query]", "[search]"}
+        return query.strip().lower() in placeholders
+
+    def _should_use_compact_schema(self) -> bool:
+        """Check if compact schema should be used based on config.
+
+        Opt-in via `memory.small_model_mode` (recommended for ~8B models).
+        Falls back to the legacy `memory.compact_schema` flag if present.
+
+        Name-based auto-detection is intentionally disabled: it false-positives
+        on capable MoE models like qwen/qwen3.5-35b-a3b that handle the full
+        schema fine. Users must opt in explicitly for small-model adaptations.
+        """
+        from openviking_cli.utils.config import get_openviking_config
+
+        try:
+            config = get_openviking_config()
+            if getattr(config.memory, "small_model_mode", False):
+                return True
+            if getattr(config.memory, "compact_schema", False):
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _is_small_model_mode(self) -> bool:
+        """Returns True if small_model_mode is enabled in config."""
+        from openviking_cli.utils.config import get_openviking_config
+
+        try:
+            config = get_openviking_config()
+            return bool(getattr(config.memory, "small_model_mode", False))
+        except Exception:
+            return False
 
     async def run(self) -> Tuple[Optional[MemoryOperations], List[Dict[str, Any]]]:
         """
@@ -103,7 +170,19 @@ class ExtractLoop:
         # 初始化 schema 生成器（使用 schemas 而非 registry）
         self.schema_model_generator = SchemaModelGenerator(schemas)
         self.schema_model_generator.generate_all_models()
-        self._json_schema = self.schema_model_generator.get_llm_json_schema()
+
+        # Compact schema opt-in via memory.small_model_mode (~1200 → ~200 tokens,
+        # strips PATCH/SEARCH-REPLACE types). Default off: the full schema keeps
+        # field descriptions that large instruction-tuned models benefit from.
+        use_compact = self._should_use_compact_schema()
+        if use_compact:
+            logger.info(
+                f"[ExtractLoop] Using compact JSON schema for model={self.model} "
+                f"(small_model_mode enabled)"
+            )
+        self._json_schema = self.schema_model_generator.get_llm_json_schema(
+            compact=use_compact
+        )
 
         # 预计算工具 schemas
         allowed_tools = self.context_provider.get_tools()
@@ -137,6 +216,87 @@ class ExtractLoop:
         messages = []
         # Single system message (some models reject multiple system messages)
         instruction_text = self.context_provider.instruction()
+
+        # Small-model output-quality preamble: compact schema strips field
+        # descriptions to save tokens, which makes small models emit empty
+        # `content` fields and skip secondary entities. This block tells them
+        # in natural language what the stripped descriptions used to say.
+        # Only injected when small_model_mode is on (gated on use_compact).
+        quality_block = ""
+        if use_compact:
+            memory_type_list = ", ".join(s.memory_type for s in schemas) or "(none)"
+            quality_block = f"""
+
+## Extraction Rules (read before generating)
+
+**WHAT to extract** (conversational memories):
+- `entities`: one card per named person (BOTH speakers, separately — never merge speakers or cross-attribute facts). Also significant objects, places, organizations mentioned.
+- `events`: things that happened, with dates. Required `summary` (who did what, where, outcome, ~80 chars) + `goal` + `date`.
+- `preferences`: stated likes, habits, values. One per speaker-topic pair.
+- `episodes`: high-level narrative summary of this session.
+- `profile`: brief user-level summary.
+
+**LEAVE EMPTY — do NOT fabricate these** (they are for AI-agent tool usage, not human conversation):
+- `skills`: `[]`
+- `tools`: `[]`
+- `cases`: `[]`
+- `patterns`: `[]`
+Never invent `call_count`, `success_time`, `problem`/`solution` from conversational content. If the conversation has no tool calls or agent actions, these stay empty arrays.
+
+**Field format** (compact schema strips descriptions — follow these rules):
+- `date`: "YYYY-MM-DD". Convert "yesterday"/"last week" to absolute using session date.
+- `ranges`: message INDEX range, format "start-end" like "0-10". NEVER a date. If unsure, use "0-999".
+- `event_name`: lowercase_with_underscores, ≤3 words, no dates in name.
+- Text fields (`content`, `summary`, `goal`): be specific but concise, ~80–150 chars. Never empty/null — if you can't fill it, skip the whole memory item.
+
+**Speaker attribution**: `[Name]:` prefixes identify who said what. Facts belong to whoever said them. Do not merge two speakers into one entity.
+
+**Memory types available**: {memory_type_list}
+
+## Worked example (study the SHAPE, use only the real conversation's facts)
+
+Conversation:
+```
+[Alex]: I started rock climbing last month at the new gym downtown. Loving it!
+[Sam]: Wow, nice. I'm more of a cyclist myself — did a 50-mile ride yesterday.
+[Alex]: 50 miles?! Insane. The rock gym has a great bouldering wall.
+[Sam]: I prefer endurance to bursts. Different brains, I guess.
+```
+
+Expected JSON output:
+```json
+{{
+  "reasoning": "Alex started rock climbing recently; Sam is a cyclist. Both have stated hobby preferences. The downtown rock gym is a notable place.",
+  "skills": [],
+  "cases": [],
+  "tools": [],
+  "patterns": [],
+  "entities": [
+    {{"name": "Alex", "content": "Started rock climbing last month at the new downtown rock gym, enjoying it. Prefers high-burst activities."}},
+    {{"name": "Sam", "content": "Cyclist who completed a 50-mile ride yesterday. Prefers endurance activities over bursts."}},
+    {{"name": "downtown rock gym", "content": "New rock climbing gym downtown where Alex started climbing. Has a great bouldering wall."}}
+  ],
+  "events": [
+    {{"event_name": "alex_started_climbing", "date": "2026-03-08", "goal": "take up a new hobby", "summary": "Alex started rock climbing last month at the new downtown rock gym.", "ranges": "0-3"}},
+    {{"event_name": "sam_50_mile_ride", "date": "2026-04-07", "goal": "endurance training", "summary": "Sam completed a 50-mile cycling ride yesterday.", "ranges": "1-3"}}
+  ],
+  "preferences": [
+    {{"user": "Alex", "topic": "rock climbing", "content": "Alex enjoys rock climbing as a recently-started hobby."}},
+    {{"user": "Sam", "topic": "endurance cycling", "content": "Sam prefers endurance cycling over high-burst activities."}}
+  ],
+  "episodes": [
+    {{"episode_title": "Comparing fitness hobbies", "session_id": "example", "session_time": "2026-04-08", "content": "Alex shares about starting rock climbing at the new downtown gym. Sam contrasts with cycling, having just done a 50-mile ride."}}
+  ],
+  "profile": {{"content": "Alex is a new rock climber. Sam is an endurance cyclist."}},
+  "edit_overview_uris": [],
+  "delete_uris": []
+}}
+```
+
+The example uses fictional names (Alex, Sam, rock climbing, cycling, gym, 50-mile ride). Match its SHAPE — 3 entities (both speakers + a secondary place), 2 events, 2 preferences, 1 episode, 1 profile, all 4 agent categories empty — but with facts from the REAL conversation below. Never copy "Alex", "Sam", "rock climbing", "cycling", "50-mile ride" or "gym" into your output; those are example data only.
+
+Output ONLY a single JSON object — no schema echo, no prose."""
+
         messages.append(
             {
                 "role": "system",
@@ -146,7 +306,7 @@ class ExtractLoop:
 See the complete JSON Schema below:
 ```json
 {schema_str}
-```""",
+```{quality_block}""",
             }
         )
 
@@ -159,6 +319,14 @@ See the complete JSON Schema below:
             vlm=self.vlm,
         )
         messages.extend(tool_call_messages)
+
+        # Add a summary nudge after prefetch to encourage direct JSON output
+        prefetch_summary = self._build_prefetch_summary(tool_call_messages)
+        if prefetch_summary:
+            messages.append({
+                "role": "user",
+                "content": prefetch_summary,
+            })
 
         while iteration < max_iterations:
             iteration += 1
@@ -224,14 +392,37 @@ See the complete JSON Schema below:
         return final_operations, tools_used
 
     async def _execute_tool_calls(self, messages, tool_calls, tools_used):
-        # Execute all tool calls in parallel
+        # Filter out placeholder tool calls (small models copy "[Keywords]" from prompts)
+        valid_tool_calls = []
+        for tc in tool_calls:
+            if tc.name == "search" and tc.arguments:
+                query = tc.arguments.get("query", "")
+                if self._is_placeholder_query(query):
+                    logger.warning(f"Skipping placeholder search query: '{query}'")
+                    add_tool_call_pair_to_messages(
+                        messages, call_id=tc.id, tool_name=tc.name,
+                        params=tc.arguments,
+                        result={"error": "Use specific keywords from the conversation, not placeholders like '[Keywords]'."},
+                    )
+                    continue
+            valid_tool_calls.append(tc)
+
+        if not valid_tool_calls:
+            # All tool calls were placeholders — nudge model to output JSON
+            messages.append({
+                "role": "user",
+                "content": "Your search queries were placeholders. Stop making tool calls — output your extraction JSON directly now.",
+            })
+            return
+
+        # Execute all valid tool calls in parallel
         async def execute_single_tool_call(idx: int, tool_call):
             """Execute a single tool call."""
             result = await self._execute_tool(tool_call)
             return idx, tool_call, result
 
         action_tasks = [
-            execute_single_tool_call(idx, tool_call) for idx, tool_call in enumerate(tool_calls)
+            execute_single_tool_call(idx, tool_call) for idx, tool_call in enumerate(valid_tool_calls)
         ]
         results = await self._execute_in_parallel(action_tasks)
 
@@ -315,9 +506,22 @@ See the complete JSON Schema below:
         tool_choice = "none" if force_final else None
 
         call_kwargs: dict = dict(messages=messages)
-        if force_final:
-            # Remove tools entirely so model can't even attempt tool calls
-            pass
+        # Skip tools entirely on the last iteration (force_final) OR when
+        # extraction_text_mode is enabled. In text mode the model is expected
+        # to output structured operations as JSON in `content`, parsed via
+        # parse_json_with_stability — no tool calls, no llama.cpp grammar
+        # constraints, no wedge on small models.
+        if force_final or self.extraction_text_mode:
+            # Small-model path: ask for JSON-object response format so backends
+            # that honor it (OpenAI, llama.cpp) enforce valid JSON output. We
+            # tested json_schema strict grammar with Bonsai 1-bit and it
+            # collapsed the model to minimum valid output (1 item per session
+            # because the schema has no `required` arrays at top level — `{}`
+            # satisfies it and the grammar gives the model an easy exit).
+            # json_object alone gives the model more breathing room to actually
+            # populate memory categories while still avoiding schema-echo.
+            if self.extraction_text_mode:
+                call_kwargs["response_format"] = {"type": "json_object"}
         else:
             call_kwargs["tools"] = self._tool_schemas
             call_kwargs["tool_choice"] = tool_choice
@@ -360,7 +564,7 @@ See the complete JSON Schema below:
         content = (response.content if hasattr(response, "content") else str(response)) or ""
         if content:
             try:
-                # print(f'LLM response content: {content}')
+                logger.info(f"[assistant] response length={len(content)} chars, first 500: {content[:500]}")
                 logger.debug(f"[assistant]\n{content}")
 
                 # Use cached operations_model and expected_fields
@@ -371,12 +575,16 @@ See the complete JSON Schema below:
                 )
 
                 if error is not None:
-                    print(f"content={content}")
                     logger.warning(f"Failed to parse memory operations: {error}")
+                    logger.info(f"Raw content (first 1000): {content[:1000]}")
                     return (None, None)
 
-                # Validate that all URIs are allowed
-                self._validate_operations(operations)
+                # Validate URIs — non-fatal, skip invalid operations but keep valid ones
+                try:
+                    self._validate_operations(operations)
+                except Exception as ve:
+                    logger.warning(f"URI validation failed (non-fatal, keeping operations): {ve}")
+
                 return (None, operations)
             except Exception as e:
                 logger.exception(f"Error parsing operations: {e}")

@@ -395,9 +395,35 @@ def parse_json_with_stability(
 
     # Layer 3: Structure tolerance
     # Handle case where model returns [{"xxx": ...}] instead of {"xxx": ...}
-    if isinstance(parsed_data, list) and len(parsed_data) > 0:
-        parsed_data = parsed_data[0]
-        logger.info("Extracted first item from list response")
+    if isinstance(parsed_data, list):
+        logger.info(f"Layer 3: got list with {len(parsed_data)} items, types: {[type(x).__name__ for x in parsed_data[:5]]}")
+        if len(parsed_data) > 0:
+            # If list contains a single dict, unwrap it
+            if len(parsed_data) == 1 and isinstance(parsed_data[0], dict):
+                parsed_data = parsed_data[0]
+                logger.info("Extracted single dict from list response")
+            # If list contains multiple dicts that look like separate operations,
+            # try to merge them into a single dict with list fields
+            elif all(isinstance(item, dict) for item in parsed_data):
+                merged = {}
+                for item in parsed_data:
+                    for k, v in item.items():
+                        if k in merged:
+                            if isinstance(merged[k], list) and isinstance(v, list):
+                                merged[k].extend(v)
+                            elif isinstance(merged[k], list):
+                                merged[k].append(v)
+                            elif isinstance(v, list):
+                                merged[k] = [merged[k]] + v
+                            else:
+                                merged[k] = [merged[k], v]
+                        else:
+                            merged[k] = v
+                parsed_data = merged
+                logger.info(f"Merged {len(parsed_data)} list items into dict with keys: {list(merged.keys())[:10]}")
+            else:
+                parsed_data = parsed_data[0]
+                logger.info("Extracted first item from list response (fallback)")
 
     if not isinstance(parsed_data, dict):
         return None, f"Expected dict after parsing, got {type(parsed_data)}"
@@ -414,13 +440,42 @@ def parse_json_with_stability(
     if model_class is None:
         return parsed_data, None
 
+    # Layer 3.5: Strip unknown fields from nested list items
+    # Small models often add extra fields (e.g., "uri") that cause strict validation to fail
+    if model_class is not None:
+        try:
+            model_fields = set(model_class.model_fields.keys())
+            for key in list(parsed_data.keys()):
+                if key not in model_fields:
+                    continue
+                val = parsed_data[key]
+                if isinstance(val, list):
+                    # Get the item model for this list field if possible
+                    field_info = model_class.model_fields.get(key)
+                    if field_info and hasattr(field_info.annotation, "__args__"):
+                        args = get_args(field_info.annotation)
+                        item_type = args[0] if args else None
+                        if item_type and hasattr(item_type, "model_fields"):
+                            allowed_keys = set(item_type.model_fields.keys())
+                            cleaned_items = []
+                            for item in val:
+                                if isinstance(item, dict):
+                                    cleaned = {k: v for k, v in item.items() if k in allowed_keys}
+                                    if cleaned:
+                                        cleaned_items.append(cleaned)
+                                else:
+                                    cleaned_items.append(item)
+                            parsed_data[key] = cleaned_items
+        except Exception as strip_e:
+            logger.debug(f"Layer 3.5 field stripping skipped: {strip_e}")
+
     # Layer 4 & 5: Validate with model
     try:
         # First try direct model validation
         return model_class.model_validate(parsed_data), None
     except Exception as e:
         logger.warning(f"Direct model validation failed, trying parse_value_with_tolerance: {e}")
-        logger.warning(f"content={content}")
+        logger.warning(f"content (first 500)={content[:500]}")
         # Fallback: Apply value fault tolerance to each field individually
         try:
             field_types = get_type_hints(model_class)

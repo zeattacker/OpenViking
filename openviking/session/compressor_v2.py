@@ -61,11 +61,20 @@ class SessionCompressorV2:
             latest_archive_overview=latest_archive_overview,
         )
 
+        # small_model_mode (memory config) implies extraction_text_mode — ~8B
+        # models like Bonsai can't handle the tools= parameter and must emit
+        # structured operations as JSON in content only. Keep the legacy
+        # vlm.extraction_text_mode flag working as an independent override.
+        vlm_text_mode = bool(getattr(config.vlm, "extraction_text_mode", False))
+        memory_small_mode = bool(getattr(config.memory, "small_model_mode", False))
+        extraction_text_mode = vlm_text_mode or memory_small_mode
+
         return ExtractLoop(
             vlm=vlm,
             viking_fs=viking_fs,
             ctx=ctx,
             context_provider=context_provider,
+            extraction_text_mode=extraction_text_mode,
         )
 
     def _get_or_create_updater(self, registry, transaction_handle=None) -> MemoryUpdater:
@@ -266,14 +275,23 @@ class SessionCompressorV2:
                             messages, user, session_id, ctx
                         )
                     if episode:
-                        # Vectorize the episode
-                        from openviking.storage.queuefs.semantic_queue import (
-                            get_semantic_queue,
+                        # Vectorize the episode — mirrors the pattern in
+                        # compressor.py:_index_memory used for regular memories.
+                        # The previous call (`queue.enqueue_vectorize`) targeted a
+                        # method that does not exist on SemanticQueue, so the call
+                        # raised AttributeError, the broad except below silently
+                        # swallowed it, and episodes were never indexed.
+                        from openviking.storage.queuefs.embedding_msg_converter import (
+                            EmbeddingMsgConverter,
                         )
 
-                        queue = get_semantic_queue()
-                        if queue:
-                            await queue.enqueue_vectorize(episode, ctx=ctx)
+                        embedding_msg = EmbeddingMsgConverter.from_context(episode)
+                        if embedding_msg:
+                            await self.vikingdb.enqueue_embedding_msg(embedding_msg)
+                            logger.info(
+                                "Enqueued episode for vectorization: %s",
+                                episode.uri,
+                            )
 
                         contexts.append(
                             Context(
