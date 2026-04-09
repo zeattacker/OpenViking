@@ -274,7 +274,35 @@ class OpenAIVLM(VLMBase):
             "temperature": self.temperature,
             "stream": self.stream,
         }
+        # top_p is part of standard OpenAI API; pass it from config when set.
+        top_p = self.config.get("top_p")
+        if top_p is not None:
+            kwargs["top_p"] = float(top_p)
         self._apply_provider_specific_extra_body(kwargs, thinking)
+        # top_k, repeat_penalty, and cache_prompt are llama.cpp / vLLM
+        # extensions outside the standard OpenAI schema; route them via
+        # extra_body which the OpenAI client forwards as additional JSON
+        # fields. Harmless for backends that ignore unknown extra_body
+        # fields (OpenAI, vLLM).
+        #   * top_k=20 is required for 1-bit Bonsai to avoid sampling
+        #     collapse into schema-echo mode.
+        #   * cache_prompt=True tells llama.cpp to preserve KV cache across
+        #     requests and reuse any matching prefix. For memory extraction
+        #     the ~2k-token system prompt + schema is identical across
+        #     sessions, so llama.cpp prefills once and reuses thereafter.
+        #     Maximum benefit with llama-server --parallel 1 (single slot).
+        extra: Dict[str, Any] = dict(kwargs.get("extra_body") or {})
+        top_k = self.config.get("top_k")
+        if top_k is not None:
+            extra["top_k"] = int(top_k)
+        repeat_penalty = self.config.get("repeat_penalty")
+        if repeat_penalty is not None:
+            extra["repeat_penalty"] = float(repeat_penalty)
+        cache_prompt = self.config.get("cache_prompt", True)
+        if cache_prompt:
+            extra["cache_prompt"] = True
+        if extra:
+            kwargs["extra_body"] = extra
         if self.max_tokens is not None:
             kwargs["max_tokens"] = self.max_tokens
         if tools:

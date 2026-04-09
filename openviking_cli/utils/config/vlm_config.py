@@ -35,6 +35,18 @@ class VLMConfig(BaseModel):
             "None = use provider default (1.0). Higher = less repetition."
         ),
     )
+    cache_prompt: bool = Field(
+        default=True,
+        description=(
+            "Tell llama.cpp to preserve KV cache across requests and reuse "
+            "matching prefixes (extra_body.cache_prompt). Default True — "
+            "dramatically accelerates prefill for repeated large system "
+            "prompts (e.g. memory extraction with schema). Harmless on "
+            "backends that ignore unknown extra_body fields (OpenAI, vLLM). "
+            "Maximum benefit with llama-server --parallel 1. Set False "
+            "only if a backend rejects unknown params."
+        ),
+    )
     max_retries: int = Field(default=3, description="Maximum retry attempts")
 
     provider: Optional[str] = Field(default=None, description="Provider type")
@@ -198,6 +210,7 @@ class VLMConfig(BaseModel):
             "top_p": self.top_p,
             "top_k": self.top_k,
             "repeat_penalty": self.repeat_penalty,
+            "cache_prompt": self.cache_prompt,
             "max_retries": self.max_retries,
             "provider": name,
             "thinking": self.thinking,
