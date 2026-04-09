@@ -5,6 +5,7 @@ URI generation and validation utilities.
 """
 
 import re
+import unicodedata
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -15,6 +16,60 @@ from openviking.session.memory.memory_type_registry import MemoryTypeRegistry
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
+
+
+# Memory types whose filename-forming string fields should be normalized to
+# a canonical lowercase_underscore form. This prevents duplicate files caused
+# by case variations ("Akmal" vs "akmal") or whitespace ("cat ist" vs
+# "cat_ist"). Only applied to fragmentation-prone types; events and episodes
+# are excluded because their filenames include date components that must
+# stay in their existing `YYYY-MM-DD_` format.
+_NORMALIZE_MEMORY_TYPES: Set[str] = {
+    "entities",
+    "cases",
+    "patterns",
+    "tools",
+    "skills",
+}
+
+# Field names (within the above memory types) to leave unchanged even if they
+# end up in a filename template. Dates and explicitly-typed identifiers would
+# break if normalized.
+_NORMALIZE_FIELD_BLOCKLIST: Set[str] = {"date", "uri", "id", "session_id"}
+
+_MAX_NORMALIZED_LENGTH = 120  # Hard cap so wild LLM outputs can't produce 500-char filenames
+
+
+def normalize_filename_component(value: str) -> str:
+    """Canonicalize a filename-forming string so different renderings of the
+    same real-world name map to the same file.
+
+    Steps:
+        1. Unicode NFKD + strip non-ASCII (fold accents)
+        2. Lowercase
+        3. Replace runs of anything that isn't [a-z0-9] with a single '_'
+        4. Strip leading/trailing underscores
+        5. Cap at _MAX_NORMALIZED_LENGTH characters
+
+    Examples:
+        "Akmal"                  -> "akmal"
+        "Gamatecha Workspace"    -> "gamatecha_workspace"
+        "cat-ist (Psikologi)"    -> "cat_ist_psikologi"
+        "Pulau Dewata"           -> "pulau_dewata"
+        ""                       -> ""   (caller must guard against empty)
+
+    Note: does NOT apply to event/episode filenames because those include
+    date components that must stay in the `YYYY-MM-DD_` format.
+    """
+    if not isinstance(value, str) or not value:
+        return value if isinstance(value, str) else ""
+    folded = unicodedata.normalize("NFKD", value)
+    folded = folded.encode("ascii", "ignore").decode("ascii")
+    lowered = folded.lower()
+    underscored = re.sub(r"[^a-z0-9]+", "_", lowered).strip("_")
+    if len(underscored) > _MAX_NORMALIZED_LENGTH:
+        underscored = underscored[:_MAX_NORMALIZED_LENGTH].rstrip("_")
+    return underscored
 
 
 def _render_jinja_template(template: str, context: Dict[str, Any]) -> str:
@@ -306,6 +361,11 @@ def extract_uri_fields_from_flat_model(model: Any, schema: MemoryTypeSchema) -> 
     """
     Extract URI-friendly fields from a flat model, ignoring patch objects.
 
+    For fragmentation-prone memory types (see _NORMALIZE_MEMORY_TYPES), string
+    field values are passed through normalize_filename_component so that
+    case/spacing variations of the same name resolve to the same file. Date
+    and identifier fields are left unchanged via _NORMALIZE_FIELD_BLOCKLIST.
+
     Args:
         model: Flat model instance (Pydantic model or dict)
         schema: Memory type schema to know which fields are part of the schema
@@ -316,12 +376,28 @@ def extract_uri_fields_from_flat_model(model: Any, schema: MemoryTypeSchema) -> 
     # Convert model to dict if it's a Pydantic model
     model_dict = model_to_dict(model)
 
+    should_normalize = schema.memory_type in _NORMALIZE_MEMORY_TYPES
+
     uri_fields = {}
     # Only include fields that are in the schema
     schema_field_names = {f.name for f in schema.fields}
     for name, value in model_dict.items():
         if name in schema_field_names and isinstance(value, (str, int, float, bool)):
-            uri_fields[name] = value
+            if (
+                should_normalize
+                and isinstance(value, str)
+                and name not in _NORMALIZE_FIELD_BLOCKLIST
+            ):
+                normalized = normalize_filename_component(value)
+                if normalized:
+                    uri_fields[name] = normalized
+                else:
+                    # Guard against empty post-normalize (e.g. all-emoji input).
+                    # Keep the original to avoid an invalid filename; the LLM
+                    # will usually correct it on the next pass.
+                    uri_fields[name] = value
+            else:
+                uri_fields[name] = value
     return uri_fields
 
 

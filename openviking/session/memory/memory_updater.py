@@ -29,6 +29,21 @@ from openviking_cli.utils import get_logger
 logger = get_logger(__name__)
 
 
+# Memory types where a new write to an already-existing URI must be merged
+# with the existing content, never overwritten. This prevents entity card
+# data loss when Phase 2 URI normalization causes naming collisions
+# ("Akmal" and "akmal" now resolve to the same file). Keep in sync with
+# uri._NORMALIZE_MEMORY_TYPES — they serve the same fragmentation-prone
+# memory types.
+_MERGE_ON_COLLISION_TYPES = {
+    "entities",
+    "cases",
+    "patterns",
+    "tools",
+    "skills",
+}
+
+
 class ExtractContext:
     """Extract context for template rendering."""
 
@@ -366,10 +381,77 @@ class MemoryUpdater:
         # Serialize content with metadata
         full_content = serialize_with_metadata(content, metadata)
 
+        # Collision-safe write for fragmentation-prone memory types.
+        # Phase 2 normalizes entity filenames, so "Akmal" and "akmal" both
+        # resolve to akmal.md. Without this guard, a new write would
+        # OVERWRITE the existing file and destroy accumulated history.
+        # Instead, if the URI already exists for these memory types, we
+        # merge the new content into the existing file as a dated section.
+        if memory_type_str in _MERGE_ON_COLLISION_TYPES:
+            try:
+                existing_content = await viking_fs.read_file(uri, ctx=ctx)
+            except Exception:
+                existing_content = ""
+            if existing_content and existing_content.strip():
+                full_content = self._merge_into_existing_entity(
+                    existing_content=existing_content,
+                    new_content=full_content,
+                    proposed_name=business_fields.get("name")
+                    or model_dict.get("name"),
+                )
+                logger.info(
+                    f"Entity collision detected at {uri} — merged new facts into existing card"
+                )
+
         # Write content to VikingFS
         # VikingFS automatically handles L0/L1/L2 and vector index updates
         await viking_fs.write_file(uri, full_content, ctx=ctx)
         logger.debug(f"Written memory: {uri}")
+
+    @staticmethod
+    def _merge_into_existing_entity(
+        existing_content: str,
+        new_content: str,
+        proposed_name: Optional[str] = None,
+    ) -> str:
+        """Append new-write content to an existing entity card without
+        clobbering the existing markdown.
+
+        Strategy (intentionally simple; the LLM will tidy up on the next
+        extraction pass via edit operations):
+
+            <existing content, unchanged>
+
+            ---
+
+            ## Update — <date>
+            <new content body, stripped of its own MEMORY_FIELDS block
+             to avoid duplicate metadata>
+
+            (optionally) alias recorded: `<proposed_name>`
+
+        The caller guarantees existing_content is non-empty.
+        """
+        import re as _re
+        from datetime import datetime, timezone
+
+        # Strip any MEMORY_FIELDS block from the new content — the existing
+        # file already has one and we don't want duplicates.
+        pattern = _re.compile(
+            r"<!--\s*MEMORY_FIELDS\s*\n.*?-->\n?",
+            flags=_re.DOTALL,
+        )
+        stripped_new = pattern.sub("", new_content).strip()
+        if not stripped_new:
+            return existing_content
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        parts = [existing_content.rstrip(), "", "---", "", f"## Update — {today}", ""]
+        if proposed_name:
+            parts.append(f"Alias encountered: `{proposed_name}`")
+            parts.append("")
+        parts.append(stripped_new)
+        return "\n".join(parts) + "\n"
 
     def _render_content_template(
         self, template: str, fields: Dict[str, Any], extract_context: Any = None

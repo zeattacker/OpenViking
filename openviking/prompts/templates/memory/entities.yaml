@@ -1,10 +1,29 @@
 memory_type: entities
 description: |
-  Entity memory - manages knowledge using Zettelkasten method.
-  Each card represents an entity with relative path links to other cards.
-  Relative path format: ../entities/entity_name.md
-  - Example: [skin_itching](../entities/skin_itching.md) → see dermatologist
-  - Cards should be rich and distributed - avoid putting all info in one card.
+  Entity memory — ONE card per distinct real-world entity.
+
+  Use for: people, organizations, projects, products, systems, places.
+
+  CRITICAL RULES:
+  - ONE entity = ONE card. Same person or thing referenced by multiple
+    names still gets a SINGLE card, with all known names listed in the
+    card's "## Aliases" section.
+  - Before creating a new entity card, scan the pre-fetched overview and
+    search results. If any existing card refers to the SAME real-world
+    entity (match by canonical name, display name, or listed alias),
+    EDIT that existing card instead of creating a new one.
+  - The entity's canonical name is the lowercase_underscore form of its
+    most formal full name. Prefer "farih_akmal_haqiqi" over "akmal",
+    "gamatecha_workspace" over "gamatecha", "model_context_protocol" over
+    "mcp". If you only know the short form, use it — but record the
+    formal name in display/content when you learn it.
+  - Never split an entity into topical sub-cards. "gamatecha_workspace",
+    "gamatecha_metrics", and "gamatecha_roadmap" about the same
+    organization belong in ONE card, with sections inside the content.
+  - Truly distinct entities that share a name substring are DIFFERENT
+    cards. "akmal" (Farih Akmal Haqiqi) and "abelakmal" (a separate
+    contributor) must stay separate — having similar names is not
+    evidence of being the same person.
 directory: "viking://user/{{ user_space }}/memories/entities"
 filename_template: "{{ name }}.md"
 enabled: true
@@ -13,26 +32,51 @@ fields:
   - name: name
     type: string
     description: |
-      # Content
-      - Entity name in Chinese or English. If English, use lowercase with underscores, max 3 words. Do not include any dates.
-  
-      ### Good Examples
-      emergency_department
-      cough_symptom
+      # Canonical name
+      The stable identifier used as the filename. Must be the lowercase
+      underscore form of the entity's most formal name. Never include
+      dates, version suffixes, or sub-topic markers.
 
-      ### Bad Examples
-      progressive_memory_loss_with_personality_change  // Too long, max 3 words
+      ### Good
+      - farih_akmal_haqiqi
+      - gamatecha_workspace
+      - model_context_protocol
+      - cat_ist
+
+      ### Bad
+      - akmal                          // nickname, prefer full formal name
+      - gamatecha_metrics              // sub-topic, belongs inside gamatecha_workspace
+      - cat_ist_2026                   // includes a date/version
+      - farih_akmal_haqiqi_details     // too long, no sub-card split
     merge_op: immutable
 
   - name: content
     type: string
     description: |
       # Content
-      - Detailed Zettelkasten card content in markdown format
-      - Use standard markdown links to connect cards:
-          [emergency_department](../entities/{name})
-          [fever](../entities/{name})
+      Markdown content describing the entity. Structure:
 
-      - One card per topic, link to related cards; if content is too long, create new cards
-      - If retrieved content is related to current card, update content to establish connections
+          # <display name>
+
+          <1-2 sentence summary: what this entity is, role, key context>
+
+          ## Key Facts
+          - <bullet list of important attributes, dates, affiliations>
+
+          ## Aliases
+          - `akmal`
+          - `Farih Akmal`
+          - `<any other known names>`
+
+          ## Related
+          - [other_entity](../entities/other_entity.md) — relationship
+
+      Rules:
+      - MAINTAIN the "## Aliases" section. Every time you see a new name
+        referring to this entity, append it there. Never delete entries.
+      - Link to related entities via relative paths `../entities/name.md`.
+      - If content grows long, expand inline — do NOT split into multiple
+        cards.
+      - When editing, preserve existing sections. Add new facts under
+        "Key Facts" or create a new dated section.
     merge_op: patch
