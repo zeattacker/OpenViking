@@ -10,6 +10,7 @@ import {
   getCaptureDecision,
   extractNewTurnTexts,
   extractLastAssistantText,
+  extractSingleMessageText,
   shouldBypassSession,
 } from "./text-utils.js";
 import {
@@ -812,6 +813,11 @@ export function createMemoryOpenVikingContextEngine(params: {
         return;
       }
 
+      // Heartbeat session — skip entirely (from upstream #1340)
+      if (afterTurnParams.isHeartbeat) {
+        return;
+      }
+
       // Exponential backoff after consecutive failures
       if (_consecutiveCaptureFailures >= MAX_CONSECUTIVE_FAILURES) {
         const backoffMs = BACKOFF_BASE_MS * Math.pow(2, _consecutiveCaptureFailures - MAX_CONSECUTIVE_FAILURES);
@@ -932,17 +938,40 @@ export function createMemoryOpenVikingContextEngine(params: {
           return;
         }
         const client = await getClient();
-        const turnText = newTexts.join("\n");
-        const sanitized = turnText.replace(/<relevant-memories>[\s\S]*?<\/relevant-memories>/gi, " ").replace(/\s+/g, " ").trim();
         const createdAt = pickLatestCreatedAt(turnMessages);
 
-        if (sanitized) {
-          await client.addSessionMessage(OVSessionId, "user", sanitized, undefined, agentId, createdAt);
-        } else {
-          diag("afterTurn_skip", OVSessionId, {
-            reason: "sanitized_empty",
-          });
+        // Group by OV role (user|assistant), merge adjacent same-role.
+        // Drops heartbeat messages and strips <relevant-memories> tags from
+        // user content. From upstream #1340 — preserves conversation
+        // structure when sending to OpenViking instead of collapsing the
+        // turn into a single "user" message.
+        const HEARTBEAT_RE = /\bHEARTBEAT(?:\.md|_OK)\b/;
+        const groups: Array<{ role: "user" | "assistant"; texts: string[] }> = [];
+        for (const msg of turnMessages) {
+          const text = extractSingleMessageText(msg);
+          if (!text) continue;
+          if (HEARTBEAT_RE.test(text)) continue;
+          const role = (msg as Record<string, unknown>).role as string;
+          const ovRole: "user" | "assistant" = role === "assistant" ? "assistant" : "user";
+          const content = ovRole === "user"
+            ? text.replace(/<relevant-memories>[\s\S]*?<\/relevant-memories>/gi, " ").replace(/\s+/g, " ").trim()
+            : text;
+          if (!content) continue;
+          const last = groups[groups.length - 1];
+          if (last && last.role === ovRole) {
+            last.texts.push(content);
+          } else {
+            groups.push({ role: ovRole, texts: [content] });
+          }
+        }
+
+        if (groups.length === 0) {
+          diag("afterTurn_skip", OVSessionId, { reason: "sanitized_empty" });
           return;
+        }
+
+        for (const group of groups) {
+          await client.addSessionMessage(OVSessionId, group.role, group.texts.join("\n"), undefined, agentId, createdAt);
         }
 
         const session = await client.getSession(OVSessionId, agentId);
