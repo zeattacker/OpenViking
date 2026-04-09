@@ -138,6 +138,8 @@ RAGbenchmark/*.log
 CLAUDE.md
 *.so
 AGENTS.md
+.claude-flow/
+tests/integration/bench_results/
 
 # Git worktrees
 .worktrees/
