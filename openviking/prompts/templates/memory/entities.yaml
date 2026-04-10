@@ -79,16 +79,18 @@ fields:
           - `<any other known names>`
 
           ## Related
-          - [other_entity](../entities/<category>/<name>.md) — relationship
-          - [event_name](../events/<year>/<month>/<day>/<event_name>.md) — participation
+          - [sibling_entity](sibling_name.md) — same category
+          - [other_category_entity](../other_category/other_name.md) — different category
+          - [event_name](../../events/<YYYY-MM-DD>_<event_name>.md) — participation
 
       Rules:
       - MAINTAIN the "## Aliases" section. Every time you see a new name
         referring to this entity, append it there. Never delete entries.
-      - Link to related entities via relative paths:
-        `../entities/<category>/<entity_name>.md`
-      - Link to events the entity participated in via relative paths:
-        `../events/<year>/<month>/<day>/<event_name>.md`
+      - Entity files live at `entities/<category>/<name>.md`. Compute
+        relative paths from THAT location:
+        - Same-category sibling: `<other_name>.md`
+        - Different category:    `../<other_category>/<other_name>.md`
+        - Event reference:       `../../events/<YYYY-MM-DD>_<event_name>.md`
       - If content grows long, expand inline — do NOT split into multiple
         cards.
       - When editing, preserve existing sections. Add new facts under
